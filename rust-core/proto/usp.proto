@@ -1,0 +1,221 @@
+syntax = "proto3";
+
+package usp;
+
+// =========================================================================
+// TR-369 USP Record (Envelope) - BBF Wire-Compatible (Tag-Matched)
+// =========================================================================
+
+message Record {
+  string version = 1;
+  string to_id = 2;
+  string from_id = 3;
+  PayloadSecurity payload_security = 4;
+  bytes mac_signature = 5;
+  bytes sender_cert = 6;
+
+  oneof record_type {
+    NoSessionContextRecord no_session_context = 7;
+    SessionContextRecord session_context = 8;
+  }
+
+  enum PayloadSecurity {
+    PLAINTEXT = 0;
+    TLS12 = 1;
+  }
+}
+
+message NoSessionContextRecord {
+  bytes payload = 2; // Serialized usp.Msg
+}
+
+message SessionContextRecord {
+  uint64 session_id = 1;
+  uint64 sequence_id = 2;
+  uint64 expected_id = 3;
+  uint64 retransmit_id = 4;
+  PayloadSARState payload_sar_state = 5;
+  PayloadSARState payloadrec_sar_state = 6;
+  repeated bytes payload = 7;
+
+  enum PayloadSARState {
+    NONE = 0;
+    BEGIN = 1;
+    INPROCESS = 2;
+    COMPLETE = 3;
+  }
+}
+
+// =========================================================================
+// TR-369 USP Msg (Application Body) - BBF Wire-Compatible
+// =========================================================================
+
+message Msg {
+  Header header = 1;
+  Body body = 2;
+}
+
+message Header {
+  string msg_id = 1;
+  MsgType msg_type = 2;
+
+  enum MsgType {
+    ERROR = 0;
+    GET = 1;
+    GET_RESP = 2;
+    NOTIFY = 3;
+    SET = 4;
+    SET_RESP = 5;
+    OPERATE = 6;
+    OPERATE_RESP = 7;
+    ADD = 8;
+    ADD_RESP = 9;
+    DELETE = 10;
+    DELETE_RESP = 11;
+    GET_SUPPORTED_DM = 12;
+    GET_SUPPORTED_DM_RESP = 13;
+    GET_INSTANCES = 14;
+    GET_INSTANCES_RESP = 15;
+    NOTIFY_RESP = 16;
+  }
+}
+
+message Body {
+  oneof msg_body {
+    Request request = 1;
+    Response response = 2;
+    Error error = 3;
+  }
+}
+
+message Request {
+  oneof req_type {
+    Get get = 1;
+    Set set = 4;
+    Operate operate = 7;
+    Notify notify = 8;
+  }
+}
+
+message Response {
+  oneof resp_type {
+    GetResp get_resp = 1;
+    SetResp set_resp = 4;
+    OperateResp operate_resp = 7;
+    NotifyResp notify_resp = 8;
+  }
+}
+
+message Error {
+  fixed32 err_code = 1;
+  string err_msg = 2;
+  repeated ParamError param_errs = 3;
+
+  message ParamError {
+    string param_path = 1;
+    fixed32 err_code = 2;
+    string err_msg = 3;
+  }
+}
+
+// =========================================================================
+// Operations, Telemetry Notifications, and Commands
+// =========================================================================
+
+message Operate {
+  string command = 1;         // e.g. "Device.Reboot()"
+  string command_key = 2;     // Request tracking UUID
+  bool send_resp = 3;
+  map<string, string> input_args = 4;
+}
+
+message OperateResp {
+  repeated OperationResult operation_results = 1;
+
+  message OperationResult {
+    string executed_command = 1;
+    oneof operation_resp {
+      string req_obj_path = 2;
+      OutputArgs req_output_args = 3;
+      CommandFailure cmd_failure = 4;
+    }
+
+    message OutputArgs {
+      map<string, string> output_args = 1;
+    }
+
+    message CommandFailure {
+      fixed32 err_code = 1;
+      string err_msg = 2;
+    }
+  }
+}
+
+message Notify {
+  string subscription_id = 1;
+  bool send_resp = 2;
+  oneof notification {
+    Event event = 3;
+    ValueChange value_change = 4;
+  }
+
+  message Event {
+    string obj_path = 1;
+    string event_name = 2;     // e.g. "PeriodicTelemetry!", "Boot!"
+    map<string, string> params = 3;
+  }
+
+  message ValueChange {
+    string param_path = 1;     // e.g. "Device.Optical.Interface.1.OpticalSignalLevel"
+    string param_value = 2;    // e.g. "-18.5"
+  }
+}
+
+message NotifyResp {
+  string subscription_id = 1;
+}
+
+message Get {
+  repeated string param_paths = 1;
+  fixed32 max_depth = 2;
+}
+
+message GetResp {
+  repeated RequestedPathResult req_path_results = 1;
+
+  message RequestedPathResult {
+    string requested_path = 1;
+    fixed32 err_code = 2;
+    string err_msg = 3;
+    repeated ResolvedPathResult resolved_path_results = 4;
+  }
+
+  message ResolvedPathResult {
+    string resolved_path = 1;
+    map<string, string> result_params = 2;
+  }
+}
+
+message Set {
+  bool allow_partial = 1;
+  repeated UpdateObject update_objs = 2;
+
+  message UpdateObject {
+    string obj_path = 1;
+    repeated UpdateParamSetting param_settings = 2;
+  }
+
+  message UpdateParamSetting {
+    string param = 1;
+    string value = 2;
+    bool required = 3;
+  }
+}
+
+message SetResp {
+  repeated UpdatedObjectResult updated_obj_results = 1;
+
+  message UpdatedObjectResult {
+    string requested_path = 1;
+  }
+}

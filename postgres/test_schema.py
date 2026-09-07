@@ -48,6 +48,30 @@ class SQLDDLParser:
         match = re.search(r"DO\s+\$\$(.*?)\$\$;", self.raw_sql, re.DOTALL | re.IGNORECASE)
         return match.group(1) if match else ""
 
+    def get_tablespace_statement(self) -> dict[str, str] | None:
+        pattern = re.compile(
+            r"CREATE\s+TABLESPACE\s+(\w+)\s+(?:OWNER\s+\w+\s+)?LOCATION\s+'([^']+)';",
+            re.IGNORECASE,
+        )
+        m = pattern.search(self.cleaned_sql)
+        if m:
+            return {"name": m.group(1), "location": m.group(2), "full_sql": m.group(0)}
+        return None
+
+    def has_tablespace_in_do_block(self) -> bool:
+        return bool(re.search(r"DO\s+\$\$.*?CREATE\s+TABLESPACE.*?\$\$;", self.raw_sql, re.DOTALL | re.IGNORECASE))
+
+    def get_views(self) -> dict[str, str]:
+        """Extracts CREATE [OR REPLACE] VIEW statements mapped by view name."""
+        views = {}
+        pattern = re.compile(
+            r"CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+(\w+)\s+AS\s+(.*?);",
+            re.DOTALL | re.IGNORECASE,
+        )
+        for match in pattern.finditer(self.cleaned_sql):
+            views[match.group(1).lower()] = match.group(2).strip()
+        return views
+
     def get_create_table_statements(self) -> dict[str, dict]:
         """Extracts CREATE [UNLOGGED] TABLE statements mapped by table name."""
         tables = {}
@@ -121,8 +145,13 @@ class MockCpeDatabase:
     def __init__(self):
         self.cpe_inventory: dict[str, dict] = {}
         self.cpe_live_state: dict[str, dict] = {}
-        self.cpe_state_history: list[dict] = []
+        self.cpe_historical_metrics: list[dict] = []
         self._history_id_seq = 1
+
+    @property
+    def cpe_state_history(self) -> list[dict]:
+        """Compatibility view property mirroring cpe_state_history."""
+        return self.cpe_historical_metrics
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -174,7 +203,7 @@ class MockCpeDatabase:
         # Simulate ON DELETE CASCADE
         if cpe_id in self.cpe_live_state:
             del self.cpe_live_state[cpe_id]
-        self.cpe_state_history = [h for h in self.cpe_state_history if h["cpe_id"] != cpe_id]
+        self.cpe_historical_metrics = [h for h in self.cpe_historical_metrics if h["cpe_id"] != cpe_id]
 
     def insert_live_state(self, record: dict) -> dict:
         cpe_id = record.get("cpe_id")
@@ -220,40 +249,52 @@ class MockCpeDatabase:
         self._trigger_reconcile(tg_op="UPDATE", old_row=old_row, new_row=new_row)
         return copy.deepcopy(new_row)
 
-    def _trigger_reconcile(self, tg_op: str, old_row: dict | None, new_row: dict) -> None:
-        """Faithfully mirrors fn_reconcile_cpe_live_state() in PL/pgSQL."""
-        cpe_id = new_row["cpe_id"]
-        # Step 1: Synchronize status and updated_at to cpe_inventory
-        if cpe_id in self.cpe_inventory:
-            self.cpe_inventory[cpe_id]["status"] = new_row["status"]
-            self.cpe_inventory[cpe_id]["updated_at"] = new_row["updated_at"]
+    @staticmethod
+    def _extract_optical_power(row: dict | None) -> float | None:
+        if not row:
+            return None
+        metrics = row.get("telemetry_metrics") or {}
+        params = row.get("current_parameters") or {}
+        val = (
+            metrics.get("rx_optical_power")
+            or metrics.get("optical_power")
+            or metrics.get("optical_rx_power")
+            or metrics.get("rx_power")
+            or params.get("Device.Optical.Interface.1.OpticalSignalLevel")
+            or params.get("Device.Optical.Interface.1.RxPower")
+        )
+        if val is not None:
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return None
+        return None
 
-        # Step 2: Determine if history snapshot is warranted
+    def _trigger_reconcile(self, tg_op: str, old_row: dict | None, new_row: dict) -> None:
+        """Faithfully mirrors reconcile_live_to_history() in PL/pgSQL."""
+        cpe_id = new_row["cpe_id"]
+        # ZERO UPDATE on cpe_inventory to prevent disk write amplification!
+
+        new_rx = self._extract_optical_power(new_row)
+        old_rx = self._extract_optical_power(old_row) if old_row else None
+
         v_should_record = False
-        v_reason = "telemetry_update"
+        v_reason = "optical_signal_variation"
 
         if tg_op == "INSERT":
-            v_reason = "initial_state"
-            v_should_record = True
-        elif tg_op == "UPDATE" and old_row is not None:
-            status_changed = old_row["status"] != new_row["status"]
-            metrics_changed = old_row["telemetry_metrics"] != new_row["telemetry_metrics"]
-            params_changed = old_row["current_parameters"] != new_row["current_parameters"]
+            if new_rx is not None:
+                v_reason = "initial_state"
+                v_should_record = True
+        elif tg_op == "UPDATE":
+            if old_rx is None and new_rx is not None:
+                v_reason = "initial_state"
+                v_should_record = True
+            elif old_rx is not None and new_rx is not None:
+                v_delta = abs(new_rx - old_rx)
+                if v_delta > 1.0:
+                    v_reason = "optical_signal_variation"
+                    v_should_record = True
 
-            if status_changed and metrics_changed:
-                v_reason = "status_and_metrics_changed"
-                v_should_record = True
-            elif status_changed:
-                v_reason = "status_changed"
-                v_should_record = True
-            elif metrics_changed:
-                v_reason = "telemetry_metrics_changed"
-                v_should_record = True
-            elif params_changed:
-                v_reason = "parameters_changed"
-                v_should_record = True
-
-        # Step 3: Insert into cpe_state_history
         if v_should_record:
             history_entry = {
                 "id": self._history_id_seq,
@@ -261,15 +302,16 @@ class MockCpeDatabase:
                 "status": new_row["status"],
                 "current_parameters": copy.deepcopy(new_row["current_parameters"]),
                 "telemetry_metrics": copy.deepcopy(new_row["telemetry_metrics"]),
+                "optical_power": new_rx,
                 "recorded_at": new_row["updated_at"],
                 "change_reason": v_reason,
             }
             self._history_id_seq += 1
-            self.cpe_state_history.append(history_entry)
+            self.cpe_historical_metrics.append(history_entry)
 
     def get_history(self, cpe_id: str) -> list[dict]:
         """Returns history snapshots ordered by recorded_at DESC."""
-        records = [h for h in self.cpe_state_history if h["cpe_id"] == cpe_id]
+        records = [h for h in self.cpe_historical_metrics if h["cpe_id"] == cpe_id]
         return sorted(records, key=lambda x: x["id"], reverse=True)
 
 
@@ -284,6 +326,7 @@ class TestPostgresSchemaDDL(unittest.TestCase):
             cls.raw_sql = f.read()
         cls.parser = SQLDDLParser(cls.raw_sql)
         cls.tables = cls.parser.get_create_table_statements()
+        cls.views = cls.parser.get_views()
         cls.indexes = cls.parser.get_indexes()
         cls.functions = cls.parser.get_functions()
         cls.triggers = cls.parser.get_triggers()
@@ -292,11 +335,14 @@ class TestPostgresSchemaDDL(unittest.TestCase):
         self.assertGreater(len(self.raw_sql.strip()), 100)
 
     def test_02_ram_tablespace_creation(self):
-        block = self.parser.get_tablespace_block()
-        self.assertTrue(len(block) > 0, "Tablespace DO block not found in init.sql")
-        self.assertIn("spcname = 'ram_tablespace'", block)
-        self.assertIn("CREATE TABLESPACE ram_tablespace", block)
-        self.assertIn("LOCATION '/var/lib/postgresql/ram_data'", block)
+        self.assertFalse(
+            self.parser.has_tablespace_in_do_block(),
+            "CREATE TABLESPACE must NOT be executed inside a DO $$ transaction block",
+        )
+        stmt = self.parser.get_tablespace_statement()
+        self.assertIsNotNone(stmt, "Top-level CREATE TABLESPACE statement not found in init.sql")
+        self.assertEqual(stmt["name"], "ram_tablespace")
+        self.assertEqual(stmt["location"], "/var/lib/postgresql/ram_data")
 
     def test_03_cpe_inventory_table_structure(self):
         self.assertIn("cpe_inventory", self.tables)
@@ -336,10 +382,10 @@ class TestPostgresSchemaDDL(unittest.TestCase):
         self.assertRegex(body, r"last_seen\s+TIMESTAMPTZ\s+NOT\s+NULL\s+DEFAULT\s+CURRENT_TIMESTAMP")
         self.assertRegex(body, r"updated_at\s+TIMESTAMPTZ\s+NOT\s+NULL\s+DEFAULT\s+CURRENT_TIMESTAMP")
 
-    def test_05_cpe_state_history_table_structure(self):
-        self.assertIn("cpe_state_history", self.tables)
-        tbl = self.tables["cpe_state_history"]
-        self.assertFalse(tbl["is_unlogged"], "cpe_state_history must be a persistent (logged) table")
+    def test_05_cpe_historical_metrics_table_structure(self):
+        self.assertIn("cpe_historical_metrics", self.tables)
+        tbl = self.tables["cpe_historical_metrics"]
+        self.assertFalse(tbl["is_unlogged"], "cpe_historical_metrics must be a persistent (logged) table")
         body = tbl["body"]
 
         # Columns & Foreign Key
@@ -348,8 +394,14 @@ class TestPostgresSchemaDDL(unittest.TestCase):
         self.assertRegex(body, r"status\s+VARCHAR\(32\)\s+NOT\s+NULL")
         self.assertRegex(body, r"current_parameters\s+JSONB\s+(?:NOT\s+NULL\s+)?DEFAULT\s+'{}'::jsonb")
         self.assertRegex(body, r"telemetry_metrics\s+JSONB\s+NOT\s+NULL\s+DEFAULT\s+'{}'::jsonb")
+        self.assertRegex(body, r"optical_power\s+NUMERIC\(6,2\)")
         self.assertRegex(body, r"recorded_at\s+TIMESTAMPTZ\s+NOT\s+NULL\s+DEFAULT\s+CURRENT_TIMESTAMP")
-        self.assertRegex(body, r"change_reason\s+VARCHAR\(64\)\s+NOT\s+NULL\s+DEFAULT\s+'telemetry_update'")
+        self.assertRegex(body, r"change_reason\s+VARCHAR\(64\)\s+NOT\s+NULL\s+DEFAULT\s+'optical_signal_variation'")
+
+        # View cpe_state_history for backward compatibility
+        self.assertIn("cpe_state_history", self.views)
+        view_body = self.views["cpe_state_history"]
+        self.assertIn("cpe_historical_metrics", view_body)
 
     def test_06_index_definitions(self):
         index_names = {idx["index_name"] for idx in self.indexes}
@@ -369,28 +421,29 @@ class TestPostgresSchemaDDL(unittest.TestCase):
 
     def test_07_trigger_and_function_definitions(self):
         self.assertIn("fn_set_updated_at", self.functions)
+        self.assertIn("reconcile_live_to_history", self.functions)
         self.assertIn("fn_reconcile_cpe_live_state", self.functions)
 
-        func_body = self.functions["fn_reconcile_cpe_live_state"]
-        self.assertIn("UPDATE cpe_inventory", func_body)
-        self.assertIn("status = NEW.status", func_body)
-        self.assertIn("updated_at = NEW.updated_at", func_body)
-        self.assertIn("INSERT INTO cpe_state_history", func_body)
-        self.assertIn("status_and_metrics_changed", func_body)
-        self.assertIn("status_changed", func_body)
-        self.assertIn("telemetry_metrics_changed", func_body)
-        self.assertIn("parameters_changed", func_body)
+        func_body = self.functions["reconcile_live_to_history"]
+        # WAL write-amplification prevention: Trigger MUST NOT update cpe_inventory
+        self.assertNotIn("UPDATE cpe_inventory", func_body, "Reconciliation trigger must NOT perform UPDATE on cpe_inventory")
+
+        # Optical threshold validation
+        self.assertIn("rx_optical_power", func_body)
+        self.assertIn("1.0", func_body)
+        self.assertIn("optical_signal_variation", func_body)
+        self.assertIn("cpe_historical_metrics", func_body)
 
         trg_names = {t["trigger_name"] for t in self.triggers}
         self.assertIn("trg_cpe_inventory_updated_at", trg_names)
-        self.assertIn("trg_cpe_live_state_reconcile", trg_names)
+        self.assertIn("reconcile_live_to_history", trg_names)
 
-        reconcile_trg = next(t for t in self.triggers if t["trigger_name"] == "trg_cpe_live_state_reconcile")
+        reconcile_trg = next(t for t in self.triggers if t["trigger_name"] == "reconcile_live_to_history")
         self.assertEqual(reconcile_trg["timing"], "AFTER")
         self.assertIn("INSERT", reconcile_trg["events"])
         self.assertIn("UPDATE", reconcile_trg["events"])
         self.assertEqual(reconcile_trg["table_name"], "cpe_live_state")
-        self.assertEqual(reconcile_trg["function_name"], "fn_reconcile_cpe_live_state")
+        self.assertEqual(reconcile_trg["function_name"], "reconcile_live_to_history")
 
     def test_08_delimiter_and_dollar_quote_balance(self):
         """Verifies balanced dollar-quoting and block structure."""
@@ -436,112 +489,111 @@ class TestTriggerReconciliationSemantics(unittest.TestCase):
             self.db.insert_live_state({"cpe_id": "cpe-nonexistent", "status": "online"})
         self.assertIn("Foreign key violation", str(ctx.exception))
 
-    def test_04_initial_telemetry_insert_reconciles_inventory_and_records_history(self):
+    def test_04_initial_telemetry_insert_records_optical_baseline(self):
         self.db.insert_inventory(self.cpe_data)
 
-        # Initial live state insert
+        # Initial live state insert with optical power
         live_record = {
             "cpe_id": "cpe-test-001",
             "endpoint_id": "proto::00259E-SN-M2-123456",
             "status": "online",
-            "telemetry_metrics": {"cpu_usage": 42.5, "memory_usage": 60.0},
+            "telemetry_metrics": {"rx_optical_power": -18.5, "cpu_usage": 42.5, "memory_usage": 60.0},
             "current_parameters": {"Device.DeviceInfo.SoftwareVersion": "1.0.0"},
         }
         self.db.insert_live_state(live_record)
 
-        # Assert inventory updated
+        # Assert cpe_inventory is NOT updated by live-state trigger (zero WAL write amplification)
         inv = self.db.cpe_inventory["cpe-test-001"]
-        self.assertEqual(inv["status"], "online")
+        self.assertEqual(inv["status"], "offline", "cpe_inventory status must NOT be modified by reconciliation trigger")
 
-        # Assert cpe_state_history has initial record
-        self.assertEqual(len(self.db.cpe_state_history), 1)
-        hist = self.db.cpe_state_history[0]
+        # Assert cpe_historical_metrics has initial record
+        self.assertEqual(len(self.db.cpe_historical_metrics), 1)
+        hist = self.db.cpe_historical_metrics[0]
         self.assertEqual(hist["cpe_id"], "cpe-test-001")
         self.assertEqual(hist["status"], "online")
         self.assertEqual(hist["change_reason"], "initial_state")
-        self.assertEqual(hist["telemetry_metrics"]["cpu_usage"], 42.5)
+        self.assertEqual(hist["optical_power"], -18.5)
 
-    def test_05_metric_alteration_creates_history_record(self):
+    def test_05_optical_variation_greater_than_1dbm_creates_history(self):
         self.db.insert_inventory(self.cpe_data)
         self.db.insert_live_state({
             "cpe_id": "cpe-test-001",
             "status": "online",
-            "telemetry_metrics": {"cpu_usage": 42.5},
+            "telemetry_metrics": {"rx_optical_power": -18.5},
         })
-        self.assertEqual(len(self.db.cpe_state_history), 1)
+        self.assertEqual(len(self.db.cpe_historical_metrics), 1)
 
-        # Update metrics (altering cpu_usage to 88.4)
+        # Update metrics with optical degradation > 1.0 dBm (-18.5 -> -21.0, delta = 2.5 dBm)
         self.db.update_live_state("cpe-test-001", {
-            "telemetry_metrics": {"cpu_usage": 88.4},
+            "telemetry_metrics": {"rx_optical_power": -21.0},
         })
 
         # History must contain 2 snapshots
-        self.assertEqual(len(self.db.cpe_state_history), 2)
-        h2 = self.db.cpe_state_history[1]
-        self.assertEqual(h2["change_reason"], "telemetry_metrics_changed")
-        self.assertEqual(h2["telemetry_metrics"]["cpu_usage"], 88.4)
+        self.assertEqual(len(self.db.cpe_historical_metrics), 2)
+        h2 = self.db.cpe_historical_metrics[1]
+        self.assertEqual(h2["change_reason"], "optical_signal_variation")
+        self.assertEqual(h2["optical_power"], -21.0)
+        # Verify cpe_inventory was NOT updated
+        self.assertEqual(self.db.cpe_inventory["cpe-test-001"]["status"], "offline")
 
-    def test_06_status_transition_reconciles_inventory_and_records_history(self):
+    def test_06_optical_variation_within_threshold_ignored(self):
         self.db.insert_inventory(self.cpe_data)
         self.db.insert_live_state({
             "cpe_id": "cpe-test-001",
             "status": "online",
-            "telemetry_metrics": {"cpu_usage": 42.5},
+            "telemetry_metrics": {"rx_optical_power": -18.5},
+        })
+        self.assertEqual(len(self.db.cpe_historical_metrics), 1)
+
+        # Update with optical variation <= 1.0 dBm (-18.5 -> -19.2, delta = 0.7 dBm)
+        self.db.update_live_state("cpe-test-001", {
+            "telemetry_metrics": {"rx_optical_power": -19.2},
         })
 
-        # Device reboots
+        # History must STILL contain only 1 record
+        self.assertEqual(len(self.db.cpe_historical_metrics), 1)
+
+    def test_07_cpu_metric_alteration_without_optical_delta_does_not_record_history(self):
+        self.db.insert_inventory(self.cpe_data)
+        self.db.insert_live_state({
+            "cpe_id": "cpe-test-001",
+            "status": "online",
+            "telemetry_metrics": {"rx_optical_power": -18.5, "cpu_usage": 42.5},
+        })
+        self.assertEqual(len(self.db.cpe_historical_metrics), 1)
+
+        # Alter CPU usage to 88.4 with unchanged optical power
+        self.db.update_live_state("cpe-test-001", {
+            "telemetry_metrics": {"rx_optical_power": -18.5, "cpu_usage": 88.4},
+        })
+
+        # History must NOT record routine CPU fluctuations (remains 1)
+        self.assertEqual(len(self.db.cpe_historical_metrics), 1)
+
+    def test_08_status_change_without_optical_delta_does_not_record_history(self):
+        self.db.insert_inventory(self.cpe_data)
+        self.db.insert_live_state({
+            "cpe_id": "cpe-test-001",
+            "status": "online",
+            "telemetry_metrics": {"rx_optical_power": -18.5},
+        })
+
+        # Device status changes to rebooting without optical delta > 1.0
         self.db.update_live_state("cpe-test-001", {"status": "rebooting"})
 
-        # Inventory status synced
-        self.assertEqual(self.db.cpe_inventory["cpe-test-001"]["status"], "rebooting")
-
-        # History updated
-        self.assertEqual(len(self.db.cpe_state_history), 2)
-        h2 = self.db.cpe_state_history[1]
-        self.assertEqual(h2["change_reason"], "status_changed")
-        self.assertEqual(h2["status"], "rebooting")
-
-    def test_07_simultaneous_status_and_metric_change(self):
-        self.db.insert_inventory(self.cpe_data)
-        self.db.insert_live_state({
-            "cpe_id": "cpe-test-001",
-            "status": "online",
-            "telemetry_metrics": {"cpu_usage": 42.5},
-        })
-
-        self.db.update_live_state("cpe-test-001", {
-            "status": "error",
-            "telemetry_metrics": {"cpu_usage": 99.9, "error_flag": True},
-        })
-
-        self.assertEqual(self.db.cpe_inventory["cpe-test-001"]["status"], "error")
-        self.assertEqual(len(self.db.cpe_state_history), 2)
-        self.assertEqual(self.db.cpe_state_history[1]["change_reason"], "status_and_metrics_changed")
-
-    def test_08_parameter_change_records_history(self):
-        self.db.insert_inventory(self.cpe_data)
-        self.db.insert_live_state({
-            "cpe_id": "cpe-test-001",
-            "status": "online",
-            "current_parameters": {"Device.WiFi.Radio.1.Status": "Down"},
-        })
-
-        self.db.update_live_state("cpe-test-001", {
-            "current_parameters": {"Device.WiFi.Radio.1.Status": "Up"},
-        })
-
-        self.assertEqual(len(self.db.cpe_state_history), 2)
-        self.assertEqual(self.db.cpe_state_history[1]["change_reason"], "parameters_changed")
+        # History remains 1, and cpe_inventory was NOT updated by live state
+        self.assertEqual(len(self.db.cpe_historical_metrics), 1)
+        self.assertEqual(self.db.cpe_inventory["cpe-test-001"]["status"], "offline")
 
     def test_09_heartbeat_last_seen_does_not_pollute_history(self):
         self.db.insert_inventory(self.cpe_data)
         self.db.insert_live_state({
             "cpe_id": "cpe-test-001",
             "status": "online",
-            "telemetry_metrics": {"cpu_usage": 42.5},
+            "telemetry_metrics": {"rx_optical_power": -18.5},
             "last_seen": "2026-09-07T00:00:00Z",
         })
-        self.assertEqual(len(self.db.cpe_state_history), 1)
+        self.assertEqual(len(self.db.cpe_historical_metrics), 1)
 
         # Heartbeat ping only modifies last_seen without metrics or status changes
         self.db.update_live_state("cpe-test-001", {
@@ -549,23 +601,23 @@ class TestTriggerReconciliationSemantics(unittest.TestCase):
         })
 
         # History should still only have 1 record
-        self.assertEqual(len(self.db.cpe_state_history), 1)
+        self.assertEqual(len(self.db.cpe_historical_metrics), 1)
 
     def test_10_cascade_delete_removes_live_state_and_history(self):
         self.db.insert_inventory(self.cpe_data)
         self.db.insert_live_state({
             "cpe_id": "cpe-test-001",
             "status": "online",
-            "telemetry_metrics": {"cpu_usage": 42.5},
+            "telemetry_metrics": {"rx_optical_power": -18.5},
         })
-        self.assertEqual(len(self.db.cpe_state_history), 1)
+        self.assertEqual(len(self.db.cpe_historical_metrics), 1)
 
         # Delete inventory
         self.db.delete_inventory("cpe-test-001")
 
         self.assertNotIn("cpe-test-001", self.db.cpe_inventory)
         self.assertNotIn("cpe-test-001", self.db.cpe_live_state)
-        self.assertEqual(len(self.db.cpe_state_history), 0)
+        self.assertEqual(len(self.db.cpe_historical_metrics), 0)
 
     def test_11_multi_device_isolation(self):
         """Ensures state changes in device A do not bleed into device B."""
@@ -579,10 +631,11 @@ class TestTriggerReconciliationSemantics(unittest.TestCase):
         self.db.insert_inventory(self.cpe_data)
         self.db.insert_inventory(cpe_b)
 
-        self.db.insert_live_state({"cpe_id": "cpe-test-001", "status": "online"})
-        self.db.insert_live_state({"cpe_id": "cpe-test-002", "status": "offline"})
+        self.db.insert_live_state({"cpe_id": "cpe-test-001", "status": "online", "telemetry_metrics": {"rx_optical_power": -18.5}})
+        self.db.insert_live_state({"cpe_id": "cpe-test-002", "status": "offline", "telemetry_metrics": {"rx_optical_power": -19.0}})
 
-        self.db.update_live_state("cpe-test-001", {"telemetry_metrics": {"cpu": 50}})
+        # Delta > 1.0 on CPE 1 (-18.5 -> -21.0, delta = 2.5)
+        self.db.update_live_state("cpe-test-001", {"telemetry_metrics": {"rx_optical_power": -21.0}})
 
         hist_a = self.db.get_history("cpe-test-001")
         hist_b = self.db.get_history("cpe-test-002")

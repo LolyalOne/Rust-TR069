@@ -2,26 +2,27 @@
 """
 Empirical Challenge Test Harness for PostgreSQL Reconciliation Triggers
 Author: Challenger 2 (teamwork_preview_challenger) - Milestone 2
-Target: /mnt/d/Projetos/TR069-181/postgres/init.sql
+Target: postgres/init.sql
 
 Verifies:
 1. simulate_flow.sh Step 4 exact expectations:
    - Initial insertion into cpe_live_state creates exactly 1 history record ('initial_state').
-   - Subsequent metric modification (e.g. cpu_usage change) creates exactly 2nd history record ('telemetry_metrics_changed').
-2. Heartbeat deduplication:
+   - Optical signal variation > 1.0 dBm creates exactly 2nd history record ('optical_signal_variation').
+   - Zero WAL write amplification: cpe_inventory is NEVER updated by the reconciliation trigger.
+2. Heartbeat & noise deduplication:
    - Routine last_seen / updated_at updates do NOT create redundant historical records.
    - Identical telemetry payloads do NOT create redundant historical records.
-3. Transition taxonomy & trigger correctness:
-   - status_and_metrics_changed
-   - status_changed
-   - telemetry_metrics_changed
-   - parameters_changed
+   - Sub-threshold optical fluctuations (<= 1.0 dBm) do NOT create redundant historical records.
+   - CPU, RAM, temperature, and IP fluctuations do NOT create historical records.
+3. Optical variation taxonomy & trigger correctness:
+   - initial_state on initial optical acquisition
+   - optical_signal_variation on |delta| > 1.0 dBm
 4. Relational integrity & Edge cases:
+   - Primary table cpe_historical_metrics and backward-compatibility view cpe_state_history.
    - Foreign key constraint and ON DELETE CASCADE behavior.
    - Multi-device isolation.
-   - JSON key ordering invariance.
    - 1000-cycle rapid heartbeat fuzzing.
-5. Static DDL inspection of init.sql.
+5. Static DDL inspection of init.sql (top-level tablespace, zero cpe_inventory updates, optical threshold).
 """
 
 import os
@@ -81,38 +82,49 @@ class RealSqlRelationalHarness:
             );
         """)
 
-        # 3. cpe_state_history
+        # 3. cpe_historical_metrics
         cur.execute("""
-            CREATE TABLE cpe_state_history (
+            CREATE TABLE cpe_historical_metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 cpe_id TEXT NOT NULL REFERENCES cpe_inventory(cpe_id) ON DELETE CASCADE,
                 status TEXT NOT NULL,
                 current_parameters TEXT DEFAULT '{}',
                 telemetry_metrics TEXT NOT NULL DEFAULT '{}',
+                optical_power REAL,
                 recorded_at TEXT NOT NULL,
-                change_reason TEXT NOT NULL DEFAULT 'telemetry_update'
+                change_reason TEXT NOT NULL DEFAULT 'optical_signal_variation'
             );
         """)
 
-        # Triggers mirroring fn_reconcile_cpe_live_state() in init.sql:
-        # Trigger A: AFTER INSERT ON cpe_live_state
+        # 4. Backward-compatibility view cpe_state_history
+        cur.execute("""
+            CREATE VIEW cpe_state_history AS
+            SELECT id, cpe_id, status, current_parameters, telemetry_metrics, optical_power, recorded_at, change_reason
+            FROM cpe_historical_metrics;
+        """)
+
+        # Triggers faithfully mirroring reconcile_live_to_history() in init.sql:
+        # Zero UPDATE on cpe_inventory (zero WAL write amplification)
         cur.execute("""
             CREATE TRIGGER trg_live_state_reconcile_insert
             AFTER INSERT ON cpe_live_state
             FOR EACH ROW
+            WHEN (
+                COALESCE(
+                    json_extract(NEW.telemetry_metrics, '$.rx_optical_power'),
+                    json_extract(NEW.telemetry_metrics, '$.optical_rx_power'),
+                    json_extract(NEW.telemetry_metrics, '$.optical_power'),
+                    json_extract(NEW.telemetry_metrics, '$.rx_power'),
+                    json_extract(NEW.current_parameters, '$.Device.Optical.Interface.1.OpticalSignalLevel')
+                ) IS NOT NULL
+            )
             BEGIN
-                -- 1. Sync live status and timestamp back to cpe_inventory
-                UPDATE cpe_inventory
-                SET status = NEW.status,
-                    updated_at = NEW.updated_at
-                WHERE cpe_id = NEW.cpe_id;
-
-                -- 2. Insert initial snapshot into history
-                INSERT INTO cpe_state_history (
+                INSERT INTO cpe_historical_metrics (
                     cpe_id,
                     status,
                     current_parameters,
                     telemetry_metrics,
+                    optical_power,
                     recorded_at,
                     change_reason
                 ) VALUES (
@@ -120,30 +132,39 @@ class RealSqlRelationalHarness:
                     NEW.status,
                     NEW.current_parameters,
                     NEW.telemetry_metrics,
+                    CAST(COALESCE(
+                        json_extract(NEW.telemetry_metrics, '$.rx_optical_power'),
+                        json_extract(NEW.telemetry_metrics, '$.optical_rx_power'),
+                        json_extract(NEW.telemetry_metrics, '$.optical_power'),
+                        json_extract(NEW.telemetry_metrics, '$.rx_power'),
+                        json_extract(NEW.current_parameters, '$.Device.Optical.Interface.1.OpticalSignalLevel')
+                    ) AS REAL),
                     NEW.updated_at,
                     'initial_state'
                 );
             END;
         """)
 
-        # Trigger B: AFTER UPDATE ON cpe_live_state
         cur.execute("""
             CREATE TRIGGER trg_live_state_reconcile_update
             AFTER UPDATE ON cpe_live_state
             FOR EACH ROW
+            WHEN (
+                COALESCE(
+                    json_extract(NEW.telemetry_metrics, '$.rx_optical_power'),
+                    json_extract(NEW.telemetry_metrics, '$.optical_rx_power'),
+                    json_extract(NEW.telemetry_metrics, '$.optical_power'),
+                    json_extract(NEW.telemetry_metrics, '$.rx_power'),
+                    json_extract(NEW.current_parameters, '$.Device.Optical.Interface.1.OpticalSignalLevel')
+                ) IS NOT NULL
+            )
             BEGIN
-                -- 1. Sync live status and timestamp back to cpe_inventory
-                UPDATE cpe_inventory
-                SET status = NEW.status,
-                    updated_at = NEW.updated_at
-                WHERE cpe_id = NEW.cpe_id;
-
-                -- 2. Detect transition type and insert snapshot if warranted
-                INSERT INTO cpe_state_history (
+                INSERT INTO cpe_historical_metrics (
                     cpe_id,
                     status,
                     current_parameters,
                     telemetry_metrics,
+                    optical_power,
                     recorded_at,
                     change_reason
                 )
@@ -152,17 +173,49 @@ class RealSqlRelationalHarness:
                     NEW.status,
                     NEW.current_parameters,
                     NEW.telemetry_metrics,
+                    CAST(COALESCE(
+                        json_extract(NEW.telemetry_metrics, '$.rx_optical_power'),
+                        json_extract(NEW.telemetry_metrics, '$.optical_rx_power'),
+                        json_extract(NEW.telemetry_metrics, '$.optical_power'),
+                        json_extract(NEW.telemetry_metrics, '$.rx_power'),
+                        json_extract(NEW.current_parameters, '$.Device.Optical.Interface.1.OpticalSignalLevel')
+                    ) AS REAL),
                     NEW.updated_at,
                     CASE
-                        WHEN (OLD.status IS NOT NEW.status) AND (OLD.telemetry_metrics IS NOT NEW.telemetry_metrics) THEN 'status_and_metrics_changed'
-                        WHEN (OLD.status IS NOT NEW.status) THEN 'status_changed'
-                        WHEN (OLD.telemetry_metrics IS NOT NEW.telemetry_metrics) THEN 'telemetry_metrics_changed'
-                        WHEN (OLD.current_parameters IS NOT NEW.current_parameters) THEN 'parameters_changed'
+                        WHEN COALESCE(
+                            json_extract(OLD.telemetry_metrics, '$.rx_optical_power'),
+                            json_extract(OLD.telemetry_metrics, '$.optical_rx_power'),
+                            json_extract(OLD.telemetry_metrics, '$.optical_power'),
+                            json_extract(OLD.telemetry_metrics, '$.rx_power'),
+                            json_extract(OLD.current_parameters, '$.Device.Optical.Interface.1.OpticalSignalLevel')
+                        ) IS NULL THEN 'initial_state'
+                        ELSE 'optical_signal_variation'
                     END
                 WHERE
-                    (OLD.status IS NOT NEW.status)
-                    OR (OLD.telemetry_metrics IS NOT NEW.telemetry_metrics)
-                    OR (OLD.current_parameters IS NOT NEW.current_parameters);
+                    COALESCE(
+                        json_extract(OLD.telemetry_metrics, '$.rx_optical_power'),
+                        json_extract(OLD.telemetry_metrics, '$.optical_rx_power'),
+                        json_extract(OLD.telemetry_metrics, '$.optical_power'),
+                        json_extract(OLD.telemetry_metrics, '$.rx_power'),
+                        json_extract(OLD.current_parameters, '$.Device.Optical.Interface.1.OpticalSignalLevel')
+                    ) IS NULL
+                    OR ABS(
+                        CAST(COALESCE(
+                            json_extract(NEW.telemetry_metrics, '$.rx_optical_power'),
+                            json_extract(NEW.telemetry_metrics, '$.optical_rx_power'),
+                            json_extract(NEW.telemetry_metrics, '$.optical_power'),
+                            json_extract(NEW.telemetry_metrics, '$.rx_power'),
+                            json_extract(NEW.current_parameters, '$.Device.Optical.Interface.1.OpticalSignalLevel')
+                        ) AS REAL)
+                        -
+                        CAST(COALESCE(
+                            json_extract(OLD.telemetry_metrics, '$.rx_optical_power'),
+                            json_extract(OLD.telemetry_metrics, '$.optical_rx_power'),
+                            json_extract(OLD.telemetry_metrics, '$.optical_power'),
+                            json_extract(OLD.telemetry_metrics, '$.rx_power'),
+                            json_extract(OLD.current_parameters, '$.Device.Optical.Interface.1.OpticalSignalLevel')
+                        ) AS REAL)
+                    ) > 1.0;
             END;
         """)
         self.conn.commit()
@@ -183,7 +236,6 @@ class RealSqlRelationalHarness:
         params_json = json.dumps(parameters, sort_keys=True)
 
         cur = self.conn.cursor()
-        # Check exists
         cur.execute("SELECT cpe_id FROM cpe_live_state WHERE cpe_id = ?", (cpe_id,))
         exists = cur.fetchone() is not None
 
@@ -218,8 +270,8 @@ class RealSqlRelationalHarness:
     def get_history(self, cpe_id: str):
         cur = self.conn.cursor()
         cur.execute("""
-            SELECT id, cpe_id, status, current_parameters, telemetry_metrics, recorded_at, change_reason
-            FROM cpe_state_history
+            SELECT id, cpe_id, status, current_parameters, telemetry_metrics, optical_power, recorded_at, change_reason
+            FROM cpe_historical_metrics
             WHERE cpe_id = ?
             ORDER BY id ASC
         """, (cpe_id,))
@@ -231,8 +283,9 @@ class RealSqlRelationalHarness:
                 "status": r[2],
                 "current_parameters": json.loads(r[3]),
                 "telemetry_metrics": json.loads(r[4]),
-                "recorded_at": r[5],
-                "change_reason": r[6],
+                "optical_power": r[5],
+                "recorded_at": r[6],
+                "change_reason": r[7],
             }
             for r in rows
         ]
@@ -265,8 +318,9 @@ class TestSimulateFlowStep4Reconciliation(unittest.TestCase):
         self.assertEqual(inv["status"], "offline")
         self.assertEqual(len(self.db.get_history(cpe_id)), 0)
 
-        # Step 2 & 3: Ingest initial telemetry payload (status=online, cpu_usage=42.5)
+        # Step 2 & 3: Ingest initial telemetry payload (status=online, rx_optical_power=-18.5, cpu_usage=42.5)
         initial_metrics = {
+            "rx_optical_power": -18.5,
             "cpu_usage": 42.5,
             "memory_usage": 68.0,
             "rx_bytes": 1048576,
@@ -284,14 +338,15 @@ class TestSimulateFlowStep4Reconciliation(unittest.TestCase):
         self.assertEqual(len(hist_1), 1, "Initial insertion MUST create exactly 1 history snapshot")
         self.assertEqual(hist_1[0]["change_reason"], "initial_state")
         self.assertEqual(hist_1[0]["status"], "online")
-        self.assertEqual(hist_1[0]["telemetry_metrics"]["cpu_usage"], 42.5)
+        self.assertEqual(hist_1[0]["optical_power"], -18.5)
 
-        # Verify cpe_inventory reconciled to 'online'
+        # Zero WAL write amplification: cpe_inventory status is NOT updated by trigger
         inv_after_step3 = self.db.get_inventory(cpe_id)
-        self.assertEqual(inv_after_step3["status"], "online")
+        self.assertEqual(inv_after_step3["status"], "offline", "cpe_inventory status must NOT be modified by trigger")
 
-        # Step 4: Metric alteration (cpu_usage: 88.4)
+        # Step 4: Metric alteration with optical degradation > 1.0 dBm (-18.5 -> -21.0, delta = 2.5 dBm)
         modified_metrics = {
+            "rx_optical_power": -21.0,
             "cpu_usage": 88.4,
             "memory_usage": 75.2,
             "rx_bytes": 2097152,
@@ -302,88 +357,106 @@ class TestSimulateFlowStep4Reconciliation(unittest.TestCase):
 
         # Verify exactly 2 history records created (satisfying simulate_flow.sh Step 4 >= 2)
         hist_2 = self.db.get_history(cpe_id)
-        self.assertEqual(len(hist_2), 2, "Metric alteration MUST create exactly 2nd history record")
+        self.assertEqual(len(hist_2), 2, "Optical delta > 1.0 dBm MUST create exactly 2nd history record")
         self.assertGreaterEqual(len(hist_2), 2, "simulate_flow.sh Step 4 assertion COUNT >= 2 satisfied")
-        self.assertEqual(hist_2[1]["change_reason"], "telemetry_metrics_changed")
+        self.assertEqual(hist_2[1]["change_reason"], "optical_signal_variation")
+        self.assertEqual(hist_2[1]["optical_power"], -21.0)
         self.assertEqual(hist_2[1]["telemetry_metrics"]["cpu_usage"], 88.4)
+
+        # Verify cpe_inventory remains untouched
+        self.assertEqual(self.db.get_inventory(cpe_id)["status"], "offline")
 
 
 class TestHeartbeatAndRoutineDeduplication(unittest.TestCase):
-    """Verifies that routine heartbeat and timestamp updates DO NOT create redundant records."""
+    """Verifies that routine heartbeat, noise, and sub-threshold variations DO NOT create records."""
 
     def setUp(self):
         self.db = RealSqlRelationalHarness()
         self.cpe_id = "HEARTBEAT-CPE-002"
         self.db.register_cpe(self.cpe_id, "HB-SERIAL-002")
-        self.initial_metrics = {"cpu_usage": 30.0, "memory_usage": 50.0}
+        self.initial_metrics = {"rx_optical_power": -18.5, "cpu_usage": 30.0, "memory_usage": 50.0}
         self.initial_params = {"Device.DeviceInfo.SoftwareVersion": "1.0.0"}
         self.db.upsert_live_state(self.cpe_id, "online", self.initial_metrics, self.initial_params)
 
     def test_single_heartbeat_does_not_pollute_history(self):
-        # Initial state = 1 history record
         self.assertEqual(len(self.db.get_history(self.cpe_id)), 1)
-
-        # Execute heartbeat update (only last_seen and updated_at change)
         self.db.update_heartbeat_only(self.cpe_id)
-
-        # History count MUST STILL be 1
         hist = self.db.get_history(self.cpe_id)
         self.assertEqual(len(hist), 1, "Routine heartbeat MUST NOT add history record")
 
     def test_1000_rapid_heartbeats_deduplicated(self):
         self.assertEqual(len(self.db.get_history(self.cpe_id)), 1)
-
         for _ in range(1000):
             self.db.update_heartbeat_only(self.cpe_id)
-
         hist = self.db.get_history(self.cpe_id)
         self.assertEqual(len(hist), 1, "1000 rapid heartbeats MUST NOT create any additional history records")
 
     def test_identical_telemetry_resend_deduplicated(self):
         self.assertEqual(len(self.db.get_history(self.cpe_id)), 1)
-
-        # Resend exact same metrics and parameters 10 times
         for _ in range(10):
             self.db.upsert_live_state(self.cpe_id, "online", self.initial_metrics, self.initial_params)
-
         hist = self.db.get_history(self.cpe_id)
         self.assertEqual(len(hist), 1, "Identical telemetry retransmission MUST NOT create history records")
 
+    def test_sub_threshold_optical_variation_ignored(self):
+        self.assertEqual(len(self.db.get_history(self.cpe_id)), 1)
+        # Delta = |-19.2 - (-18.5)| = 0.7 dBm <= 1.0 dBm
+        sub_metrics = dict(self.initial_metrics, rx_optical_power=-19.2)
+        self.db.upsert_live_state(self.cpe_id, "online", sub_metrics, self.initial_params)
+        hist = self.db.get_history(self.cpe_id)
+        self.assertEqual(len(hist), 1, "Sub-1.0 dBm variation MUST NOT create history record")
+
+    def test_exact_threshold_boundary(self):
+        self.assertEqual(len(self.db.get_history(self.cpe_id)), 1)
+        # Exactly 1.0 dBm delta: |-19.5 - (-18.5)| = 1.00 dBm (strictly > 1.0 required)
+        boundary_metrics = dict(self.initial_metrics, rx_optical_power=-19.5)
+        self.db.upsert_live_state(self.cpe_id, "online", boundary_metrics, self.initial_params)
+        self.assertEqual(len(self.db.get_history(self.cpe_id)), 1, "Delta == 1.00 dBm MUST NOT fire trigger")
+
+        # Delta > 1.0 dBm from current state (-19.5 -> -20.6, delta = 1.1 dBm > 1.0 dBm)
+        trigger_metrics = dict(self.initial_metrics, rx_optical_power=-20.6)
+        self.db.upsert_live_state(self.cpe_id, "online", trigger_metrics, self.initial_params)
+        self.assertEqual(len(self.db.get_history(self.cpe_id)), 2, "Delta > 1.0 dBm MUST fire trigger")
+
 
 class TestTransitionTaxonomyAndEdgeCases(unittest.TestCase):
-    """Stress tests transition reasons, multi-device isolation, cascading, and JSON invariance."""
+    """Stress tests transition reasons, multi-device isolation, cascading, and non-optical noise."""
 
     def setUp(self):
         self.db = RealSqlRelationalHarness()
         self.cpe_id = "EDGE-CPE-003"
         self.db.register_cpe(self.cpe_id, "EDGE-SERIAL-003")
-        self.metrics = {"cpu": 10.0}
+        self.metrics = {"rx_optical_power": -18.5, "cpu": 10.0}
         self.params = {"sw": "1.0"}
         self.db.upsert_live_state(self.cpe_id, "online", self.metrics, self.params)
 
-    def test_status_change_only(self):
-        self.db.upsert_live_state(self.cpe_id, "offline", self.metrics, self.params)
+    def test_optical_signal_improvement_triggers(self):
+        """Signal attenuation reduction (improvement, e.g. -18.5 -> -16.0, delta 2.5 > 1.0) must record snapshot."""
+        improved_metrics = dict(self.metrics, rx_optical_power=-16.0)
+        self.db.upsert_live_state(self.cpe_id, "online", improved_metrics, self.params)
         hist = self.db.get_history(self.cpe_id)
         self.assertEqual(len(hist), 2)
-        self.assertEqual(hist[1]["change_reason"], "status_changed")
-        self.assertEqual(hist[1]["status"], "offline")
+        self.assertEqual(hist[1]["change_reason"], "optical_signal_variation")
+        self.assertEqual(hist[1]["optical_power"], -16.0)
 
-    def test_parameters_change_only(self):
+    def test_status_change_alone_does_not_record_history(self):
+        self.db.upsert_live_state(self.cpe_id, "offline", self.metrics, self.params)
+        hist = self.db.get_history(self.cpe_id)
+        self.assertEqual(len(hist), 1, "Status change without optical variation must NOT create history snapshot")
+        # Ensure cpe_inventory status is untouched
+        self.assertEqual(self.db.get_inventory(self.cpe_id)["status"], "offline")
+
+    def test_parameters_change_alone_does_not_record_history(self):
         new_params = {"sw": "2.0"}
         self.db.upsert_live_state(self.cpe_id, "online", self.metrics, new_params)
         hist = self.db.get_history(self.cpe_id)
-        self.assertEqual(len(hist), 2)
-        self.assertEqual(hist[1]["change_reason"], "parameters_changed")
-        self.assertEqual(hist[1]["current_parameters"]["sw"], "2.0")
+        self.assertEqual(len(hist), 1, "Parameter change without optical variation must NOT create history snapshot")
 
-    def test_status_and_metrics_simultaneous_change(self):
-        new_metrics = {"cpu": 99.9}
-        self.db.upsert_live_state(self.cpe_id, "degraded", new_metrics, self.params)
+    def test_cpu_and_memory_fluctuation_does_not_record_history(self):
+        noisy_metrics = dict(self.metrics, cpu=99.9, memory=95.0, temp=75.0)
+        self.db.upsert_live_state(self.cpe_id, "online", noisy_metrics, self.params)
         hist = self.db.get_history(self.cpe_id)
-        self.assertEqual(len(hist), 2)
-        self.assertEqual(hist[1]["change_reason"], "status_and_metrics_changed")
-        self.assertEqual(hist[1]["status"], "degraded")
-        self.assertEqual(hist[1]["telemetry_metrics"]["cpu"], 99.9)
+        self.assertEqual(len(hist), 1, "CPU/RAM/Temp fluctuations without optical delta must NOT create history snapshot")
 
     def test_foreign_key_violation_on_unregistered_cpe(self):
         with self.assertRaises(sqlite3.IntegrityError):
@@ -397,30 +470,31 @@ class TestTransitionTaxonomyAndEdgeCases(unittest.TestCase):
     def test_multi_device_isolation(self):
         cpe_2 = "CPE-004"
         self.db.register_cpe(cpe_2, "SERIAL-004")
-        self.db.upsert_live_state(cpe_2, "online", {"cpu": 20}, {})
+        self.db.upsert_live_state(cpe_2, "online", {"rx_optical_power": -19.0, "cpu": 20}, {})
 
-        # Mutate CPE 2
-        self.db.upsert_live_state(cpe_2, "online", {"cpu": 50}, {})
+        # Mutate CPE 2 with delta > 1.0 dBm (-19.0 -> -22.0, delta 3.0)
+        self.db.upsert_live_state(cpe_2, "online", {"rx_optical_power": -22.0, "cpu": 50}, {})
 
-        # Check CPE 1 is completely unaffected
         hist_1 = self.db.get_history(self.cpe_id)
         hist_2 = self.db.get_history(cpe_2)
         self.assertEqual(len(hist_1), 1)
         self.assertEqual(len(hist_2), 2)
 
-    def test_interleaved_heartbeats_and_metric_mutations(self):
+    def test_interleaved_heartbeats_and_optical_mutations(self):
         """
-        Interleave 5000 heartbeats with 5 distinct metric changes.
+        Interleave 5000 heartbeats with 5 distinct optical mutations > 1.0 dBm.
         Assert that EXACTLY 1 (initial) + 5 (mutations) = 6 history records exist.
         """
         expected_records = 1
+        current_rx = -18.5
         for i in range(1, 6):
             # 1000 routine heartbeats
             for _ in range(1000):
                 self.db.update_heartbeat_only(self.cpe_id)
-            
-            # Metric mutation
-            self.db.upsert_live_state(self.cpe_id, "online", {"cpu": 10.0 + i * 10}, self.params)
+
+            # Optical mutation by 1.5 dBm
+            current_rx -= 1.5
+            self.db.upsert_live_state(self.cpe_id, "online", {"rx_optical_power": current_rx}, self.params)
             expected_records += 1
 
         hist = self.db.get_history(self.cpe_id)
@@ -428,36 +502,15 @@ class TestTransitionTaxonomyAndEdgeCases(unittest.TestCase):
         reasons = [h["change_reason"] for h in hist]
         self.assertEqual(reasons[0], "initial_state")
         for r in reasons[1:]:
-            self.assertEqual(r, "telemetry_metrics_changed")
+            self.assertEqual(r, "optical_signal_variation")
 
     def test_ip_address_change_does_not_pollute_history(self):
-        """
-        cpe_state_history does not track ip_address; changing IP must not record history.
-        """
         cur = self.db.conn.cursor()
         cur.execute("UPDATE cpe_live_state SET ip_address = '192.168.1.100' WHERE cpe_id = ?", (self.cpe_id,))
         self.db.conn.commit()
 
         hist = self.db.get_history(self.cpe_id)
         self.assertEqual(len(hist), 1, "IP address change must not trigger history snapshot")
-
-    def test_nested_parameter_json_change(self):
-        """
-        Verify that nested JSON structures in current_parameters trigger parameters_changed.
-        """
-        nested_params = {
-            "Device": {
-                "WiFi": {
-                    "Radio": {"1": {"Status": "Down", "Channels": [1, 6, 11]}}
-                }
-            }
-        }
-        self.db.upsert_live_state(self.cpe_id, "online", self.metrics, nested_params)
-        hist = self.db.get_history(self.cpe_id)
-        self.assertEqual(len(hist), 2)
-        self.assertEqual(hist[1]["change_reason"], "parameters_changed")
-        self.assertEqual(hist[1]["current_parameters"]["Device"]["WiFi"]["Radio"]["1"]["Status"], "Down")
-
 
 
 class TestInitSqlStaticAST(unittest.TestCase):
@@ -471,34 +524,42 @@ class TestInitSqlStaticAST(unittest.TestCase):
     def test_unlogged_ram_tablespace(self):
         self.assertRegex(self.sql, r"CREATE\s+UNLOGGED\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?cpe_live_state")
         self.assertIn("TABLESPACE ram_tablespace", self.sql)
-        self.assertIn("LOCATION '/var/lib/postgresql/ram_data'", self.sql)
+        self.assertIn("CREATE TABLESPACE ram_tablespace LOCATION '/var/lib/postgresql/ram_data';", self.sql)
+
+    def test_tablespace_not_in_do_block(self):
+        has_do_block = re.search(r"DO\s+\$\$.*?CREATE\s+TABLESPACE.*?\$\$;", self.sql, re.DOTALL | re.IGNORECASE)
+        self.assertIsNone(has_do_block, "CREATE TABLESPACE must NOT be inside a DO $$ block")
 
     def test_trigger_timing_and_event(self):
         self.assertRegex(
             self.sql,
-            r"CREATE\s+TRIGGER\s+trg_cpe_live_state_reconcile\s+AFTER\s+INSERT\s+OR\s+UPDATE\s+ON\s+cpe_live_state\s+FOR\s+EACH\s+ROW\s+EXECUTE\s+FUNCTION\s+fn_reconcile_cpe_live_state\(\);",
+            r"CREATE\s+TRIGGER\s+reconcile_live_to_history\s+AFTER\s+INSERT\s+OR\s+UPDATE\s+ON\s+cpe_live_state\s+FOR\s+EACH\s+ROW\s+EXECUTE\s+FUNCTION\s+reconcile_live_to_history\(\);",
         )
 
-    def test_fn_reconcile_branches(self):
-        self.assertIn("v_reason := 'initial_state';", self.sql)
-        self.assertIn("v_reason := 'status_and_metrics_changed';", self.sql)
-        self.assertIn("v_reason := 'status_changed';", self.sql)
-        self.assertIn("v_reason := 'telemetry_metrics_changed';", self.sql)
-        self.assertIn("v_reason := 'parameters_changed';", self.sql)
-
-    def test_heartbeat_timestamp_deduplication_in_sql(self):
-        # Ensure updated_at and last_seen are NOT in the IF condition that sets v_should_record
-        func_match = re.search(r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+fn_reconcile_cpe_live_state\(\).*?\$\$(.*?)\$\$", self.sql, re.DOTALL)
+    def test_no_wal_write_amplification(self):
+        func_match = re.search(r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+reconcile_live_to_history\(\).*?\$\$(.*?)\$\$", self.sql, re.DOTALL)
         self.assertIsNotNone(func_match)
         func_body = func_match.group(1)
+        self.assertNotIn("UPDATE cpe_inventory", func_body, "Trigger must NOT update cpe_inventory")
 
-        # Check update condition
-        if_update_match = re.search(r"ELSIF\s+\(TG_OP\s*=\s*'UPDATE'\)\s+THEN(.*?)END\s+IF;", func_body, re.DOTALL)
-        self.assertIsNotNone(if_update_match)
-        conditions = if_update_match.group(1)
+    def test_optical_threshold_in_sql(self):
+        func_match = re.search(r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+reconcile_live_to_history\(\).*?\$\$(.*?)\$\$", self.sql, re.DOTALL)
+        self.assertIsNotNone(func_match)
+        func_body = func_match.group(1)
+        self.assertIn("rx_optical_power", func_body)
+        self.assertIn("1.0", func_body)
+        self.assertIn("optical_signal_variation", func_body)
+        self.assertIn("cpe_historical_metrics", func_body)
 
-        self.assertNotIn("last_seen", conditions, "last_seen must NOT trigger history records")
-        self.assertNotIn("updated_at", conditions, "updated_at must NOT trigger history records")
+    def test_cpe_historical_metrics_table_and_view(self):
+        self.assertIn("CREATE TABLE IF NOT EXISTS cpe_historical_metrics", self.sql)
+        self.assertIn("CREATE OR REPLACE VIEW cpe_state_history", self.sql)
+
+    def test_heartbeat_timestamp_deduplication_in_sql(self):
+        func_match = re.search(r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+reconcile_live_to_history\(\).*?\$\$(.*?)\$\$", self.sql, re.DOTALL)
+        self.assertIsNotNone(func_match)
+        func_body = func_match.group(1)
+        self.assertNotIn("last_seen", func_body, "last_seen must NOT trigger history records")
 
     def test_foreign_key_cascades(self):
         self.assertIn("REFERENCES cpe_inventory(cpe_id) ON DELETE CASCADE", self.sql)

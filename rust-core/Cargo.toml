@@ -1,0 +1,34 @@
+[package]
+name = "rust-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Teamwork ACS Engineering Team"]
+description = "High-Performance Asynchronous TR-369 / USP Core Worker over MQTT"
+
+[dependencies]
+tokio = { version = "1.38", features = ["full"] }
+rumqttc = "0.24"
+sqlx = { version = "0.7", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "json",
+    "chrono"
+] }
+prost = "0.12"
+prost-types = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+
+[build-dependencies]
+prost-build = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

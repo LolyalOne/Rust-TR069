@@ -8,6 +8,8 @@ Coordinate, monitor, and independently audit the TR-369/USP ACS project executio
 - Working directory: /mnt/d/Projetos/TR069-181/.agents/sentinel_1
 - Orchestrator: 6258e12c-9553-47a2-9624-69521a0b2d82
 - Victory Auditor: to be spawned on victory claim
+- Working directory (resumed): /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/sentinel_1
+- Orchestrator 2: 72558cd4-b522-4129-816f-63bb0c581dfa
 
 ## 🔒 Key Constraints
 - No technical decisions — relay only
@@ -17,15 +19,19 @@ Coordinate, monitor, and independently audit the TR-369/USP ACS project executio
 - Clean up all crons and subagents upon verified completion
 
 ## User Context
-- **Last user request**: Develop TR-369/USP ACS on MQTT with Postgres, Mosquitto, Rust Core Worker, FastAPI Manager, devcontainer, setup app, CLI flow simulation, and git remote push.
+- **Last user request**: Finalizar ACS TR-369/USP (Milestone 2 PostgreSQL fix, Milestone 3 Rust Core, Milestone 4 Python FastAPI, README.md, simulate_flow.sh pass).
 - **Pending clarifications**: none
-- **Delivered results**: Milestone 1 passed (R1, R2, R3 complete)
+- **Delivered results**: Milestone 1 complete; Milestone 2 partially done; Milestone 3 & 4 pending implementation.
 
 ## Project Status
-- **Phase**: in progress (Milestone 2 schema delivered, currently under panel evaluation)
-- **Liveness**: Healthy (agents active < 1 min ago)
-- **Cron 1 (Progress)**: task-14
-- **Cron 2 (Liveness)**: task-16
+- **Phase**: in progress (orchestrator_2 dispatched and actively executing)
+- **Liveness**: Healthy
+- **Cron 1 (Progress)**: task-34
+- **Cron 2 (Liveness)**: task-36
+
+## Routing Decision
+- **Route**: General (`teamwork_preview_orchestrator`)
+- **Rationale**: Multi-milestone SWE task involving PostgreSQL DB fixes, Rust Core worker service, Python FastAPI manager service, documentation and E2E integration test.
 
 ## Victory Audit Status
 - **Triggered**: no
@@ -33,14 +39,13 @@ Coordinate, monitor, and independently audit the TR-369/USP ACS project executio
 - **Retry count**: 0
 
 ## Artifact Index
-- /mnt/d/Projetos/TR069-181/ORIGINAL_REQUEST.md — Authoritative verbatim user request
-- /mnt/d/Projetos/TR069-181/.agents/ORIGINAL_REQUEST.md — Authoritative verbatim user request (.agents)
-- /mnt/d/Projetos/TR069-181/.agents/sentinel_1/BRIEFING.md — Sentinel persistent working memory
-- /mnt/d/Projetos/TR069-181/.agents/orchestrator_1/ — Project Orchestrator workspace
-- /mnt/d/Projetos/TR069-181/.agents/orchestrator_1/PROJECT.md — Global architecture & feature map
-- /mnt/d/Projetos/TR069-181/.agents/orchestrator_1/TEST_INFRA.md — E2E test plan & verification contract
-- /mnt/d/Projetos/TR069-181/docker-compose.yml — Docker compose with strict memory limits & tmpfs (R1)
-- /mnt/d/Projetos/TR069-181/.devcontainer/devcontainer.json — DevContainer configuration (R2)
-- /mnt/d/Projetos/TR069-181/configure_limits.py — Memory limit configuration CLI application (R3)
-- /mnt/d/Projetos/TR069-181/postgres/init.sql — Hybrid PostgreSQL schema & triggers (R4)
-- /mnt/d/Projetos/TR069-181/simulate_flow.sh — Automated E2E verification test harness
+- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/ORIGINAL_REQUEST.md — Authoritative verbatim user request
+- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/ORIGINAL_REQUEST.md — Authoritative verbatim user request (.agents)
+- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/HANDOVER_STATUS.md — Continuous development guidance & milestone status
+- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/sentinel_1/BRIEFING.md — Sentinel persistent working memory
+- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/orchestrator_1/ — Previous Orchestrator workspace & handoff
+- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/orchestrator_2/ — Active Project Orchestrator workspace
+- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/spec_miner_usp_1/handoff.md — Spec miner TR-369 research handoff
+- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/docker-compose.yml — Docker compose with strict memory limits & tmpfs
+- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/postgres/init.sql — Hybrid PostgreSQL schema & triggers
+- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/simulate_flow.sh — Automated E2E verification test harness

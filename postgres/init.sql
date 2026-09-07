@@ -14,12 +14,9 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 -- In Docker Compose, tmpfs is mounted at /var/lib/postgresql/ram_data with uid=70, gid=70.
 -- Placing unlogged tables in this tablespace guarantees zero WAL writes and
 -- microsecond volatile access in RAM.
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_tablespace WHERE spcname = 'ram_tablespace') THEN
-        CREATE TABLESPACE ram_tablespace LOCATION '/var/lib/postgresql/ram_data';
-    END IF;
-END $$;
+-- Note: CREATE TABLESPACE cannot be executed inside a transaction block.
+-- It must be executed as a top-level command.
+CREATE TABLESPACE ram_tablespace LOCATION '/var/lib/postgresql/ram_data';
 
 -- ----------------------------------------------------------------------------
 -- 2. Persistent CPE Inventory Table
@@ -68,23 +65,30 @@ CREATE INDEX IF NOT EXISTS idx_cpe_live_status ON cpe_live_state(status);
 CREATE INDEX IF NOT EXISTS idx_cpe_live_last_seen ON cpe_live_state(last_seen);
 
 -- ----------------------------------------------------------------------------
--- 4. Persistent Historical State Table
+-- 4. Persistent Historical Metrics Table
 -- ----------------------------------------------------------------------------
 -- Durable audit log and time-series telemetry archive. Populated automatically
--- by the PL/pgSQL reconciliation trigger upon state or metric modifications.
-CREATE TABLE IF NOT EXISTS cpe_state_history (
+-- by the PL/pgSQL reconciliation trigger strictly when optical signal variation
+-- exceeds 1.0 dBm (|NEW - OLD| > 1.0 dBm).
+CREATE TABLE IF NOT EXISTS cpe_historical_metrics (
     id BIGSERIAL PRIMARY KEY,
     cpe_id VARCHAR(128) NOT NULL REFERENCES cpe_inventory(cpe_id) ON DELETE CASCADE,
     status VARCHAR(32) NOT NULL,
     current_parameters JSONB DEFAULT '{}'::jsonb,
     telemetry_metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+    optical_power NUMERIC(6,2),
     recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    change_reason VARCHAR(64) NOT NULL DEFAULT 'telemetry_update'
+    change_reason VARCHAR(64) NOT NULL DEFAULT 'optical_signal_variation'
 );
 
-CREATE INDEX IF NOT EXISTS idx_cpe_history_lookup ON cpe_state_history(cpe_id, recorded_at DESC);
-CREATE INDEX IF NOT EXISTS idx_cpe_history_telemetry ON cpe_state_history USING gin (telemetry_metrics);
-CREATE INDEX IF NOT EXISTS idx_cpe_history_recorded_at ON cpe_state_history(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_cpe_history_lookup ON cpe_historical_metrics(cpe_id, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cpe_history_telemetry ON cpe_historical_metrics USING gin (telemetry_metrics);
+CREATE INDEX IF NOT EXISTS idx_cpe_history_recorded_at ON cpe_historical_metrics(recorded_at);
+
+-- Backward compatibility view for cpe_state_history
+CREATE OR REPLACE VIEW cpe_state_history AS
+SELECT id, cpe_id, status, current_parameters, telemetry_metrics, recorded_at, change_reason
+FROM cpe_historical_metrics;
 
 -- ----------------------------------------------------------------------------
 -- 5. Updated_At Helper Functions and Triggers
@@ -113,48 +117,93 @@ EXECUTE FUNCTION fn_set_updated_at();
 -- 6. State Reconciliation Function and Trigger
 -- ----------------------------------------------------------------------------
 -- Automatically reconciles volatile in-RAM changes to persistent storage:
---   1. Synchronizes status and updated_at to cpe_inventory.
---   2. Detects metric alterations, status changes, and parameter updates.
---   3. Snapshots meaningful transitions into cpe_state_history with change_reason.
-CREATE OR REPLACE FUNCTION fn_reconcile_cpe_live_state()
+--   1. Strictly triggers when optical signal variation is > 1.0 dBm (|NEW - OLD| > 1.0 dBm).
+--   2. Records initial baseline snapshot when optical signal is first acquired.
+--   3. Inserts into cpe_historical_metrics (accessible via cpe_state_history view).
+--   4. NEVER performs UPDATE on cpe_inventory (zero WAL write amplification).
+CREATE OR REPLACE FUNCTION reconcile_live_to_history()
 RETURNS TRIGGER AS $$
 DECLARE
-    v_reason VARCHAR(64);
+    v_new_rx_power NUMERIC := NULL;
+    v_old_rx_power NUMERIC := NULL;
+    v_new_val TEXT := NULL;
+    v_old_val TEXT := NULL;
+    v_delta NUMERIC := 0.0;
+    v_reason VARCHAR(64) := 'optical_signal_variation';
     v_should_record BOOLEAN := FALSE;
 BEGIN
-    -- 1. Sync live status and timestamp back to cpe_inventory
-    UPDATE cpe_inventory
-    SET status = NEW.status,
-        updated_at = NEW.updated_at
-    WHERE cpe_id = NEW.cpe_id;
+    -- 1. Extract optical power from NEW.telemetry_metrics or current_parameters
+    IF NEW.telemetry_metrics IS NOT NULL THEN
+        v_new_val := COALESCE(
+            NEW.telemetry_metrics->>'rx_optical_power',
+            NEW.telemetry_metrics->>'optical_power',
+            NEW.telemetry_metrics->>'optical_rx_power',
+            NEW.telemetry_metrics->>'rx_power'
+        );
+    END IF;
+    IF v_new_val IS NULL AND NEW.current_parameters IS NOT NULL THEN
+        v_new_val := COALESCE(
+            NEW.current_parameters->>'Device.Optical.Interface.1.OpticalSignalLevel',
+            NEW.current_parameters->>'Device.Optical.Interface.1.RxPower'
+        );
+    END IF;
 
-    -- 2. Detect transition type and determine if historical snapshot is required
-    IF (TG_OP = 'INSERT') THEN
-        v_reason := 'initial_state';
-        v_should_record := TRUE;
-    ELSIF (TG_OP = 'UPDATE') THEN
-        IF (OLD.status IS DISTINCT FROM NEW.status) AND (OLD.telemetry_metrics IS DISTINCT FROM NEW.telemetry_metrics) THEN
-            v_reason := 'status_and_metrics_changed';
-            v_should_record := TRUE;
-        ELSIF (OLD.status IS DISTINCT FROM NEW.status) THEN
-            v_reason := 'status_changed';
-            v_should_record := TRUE;
-        ELSIF (OLD.telemetry_metrics IS DISTINCT FROM NEW.telemetry_metrics) THEN
-            v_reason := 'telemetry_metrics_changed';
-            v_should_record := TRUE;
-        ELSIF (OLD.current_parameters IS DISTINCT FROM NEW.current_parameters) THEN
-            v_reason := 'parameters_changed';
-            v_should_record := TRUE;
+    IF v_new_val IS NOT NULL AND v_new_val ~ '^-?[0-9]+(\.[0-9]+)?$' THEN
+        v_new_rx_power := v_new_val::numeric;
+    END IF;
+
+    -- 2. Extract optical power from OLD on UPDATE
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.telemetry_metrics IS NOT NULL THEN
+            v_old_val := COALESCE(
+                OLD.telemetry_metrics->>'rx_optical_power',
+                OLD.telemetry_metrics->>'optical_power',
+                OLD.telemetry_metrics->>'optical_rx_power',
+                OLD.telemetry_metrics->>'rx_power'
+            );
+        END IF;
+        IF v_old_val IS NULL AND OLD.current_parameters IS NOT NULL THEN
+            v_old_val := COALESCE(
+                OLD.current_parameters->>'Device.Optical.Interface.1.OpticalSignalLevel',
+                OLD.current_parameters->>'Device.Optical.Interface.1.RxPower'
+            );
+        END IF;
+
+        IF v_old_val IS NOT NULL AND v_old_val ~ '^-?[0-9]+(\.[0-9]+)?$' THEN
+            v_old_rx_power := v_old_val::numeric;
         END IF;
     END IF;
 
-    -- 3. Record snapshot in persistent history
+    -- 3. Evaluate optical variation conditions:
+    -- On INSERT: record baseline snapshot if optical power is present
+    IF TG_OP = 'INSERT' THEN
+        IF v_new_rx_power IS NOT NULL THEN
+            v_reason := 'initial_state';
+            v_should_record := TRUE;
+        END IF;
+    ELSIF TG_OP = 'UPDATE' THEN
+        -- If old had no optical reading and new does, record initial optical baseline
+        IF v_old_rx_power IS NULL AND v_new_rx_power IS NOT NULL THEN
+            v_reason := 'initial_state';
+            v_should_record := TRUE;
+        ELSIF v_old_rx_power IS NOT NULL AND v_new_rx_power IS NOT NULL THEN
+            v_delta := abs(v_new_rx_power - v_old_rx_power);
+            -- Strictly trigger when optical signal variation is > 1.0 dBm
+            IF v_delta > 1.0 THEN
+                v_reason := 'optical_signal_variation';
+                v_should_record := TRUE;
+            END IF;
+        END IF;
+    END IF;
+
+    -- 4. Record snapshot in persistent history table (WITHOUT updating cpe_inventory)
     IF v_should_record THEN
-        INSERT INTO cpe_state_history (
+        INSERT INTO cpe_historical_metrics (
             cpe_id,
             status,
             current_parameters,
             telemetry_metrics,
+            optical_power,
             recorded_at,
             change_reason
         ) VALUES (
@@ -162,6 +211,7 @@ BEGIN
             NEW.status,
             NEW.current_parameters,
             NEW.telemetry_metrics,
+            v_new_rx_power,
             COALESCE(NEW.updated_at, CURRENT_TIMESTAMP),
             v_reason
         );
@@ -171,8 +221,17 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Backward compatibility alias function
+CREATE OR REPLACE FUNCTION fn_reconcile_cpe_live_state()
+RETURNS TRIGGER AS $$
+BEGIN
+    RETURN reconcile_live_to_history();
+END;
+$$ LANGUAGE plpgsql;
+
 DROP TRIGGER IF EXISTS trg_cpe_live_state_reconcile ON cpe_live_state;
-CREATE TRIGGER trg_cpe_live_state_reconcile
+DROP TRIGGER IF EXISTS reconcile_live_to_history ON cpe_live_state;
+CREATE TRIGGER reconcile_live_to_history
 AFTER INSERT OR UPDATE ON cpe_live_state
 FOR EACH ROW
-EXECUTE FUNCTION fn_reconcile_cpe_live_state();
+EXECUTE FUNCTION reconcile_live_to_history();

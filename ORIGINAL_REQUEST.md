@@ -56,3 +56,36 @@ Ao final do desenvolvimento e dos testes, a equipe deve inicializar o repositór
 ### Controle de Versão
 - [ ] O comando `git remote -v` aponta corretamente para `https://github.com/LolyalOne/Rust-TR069.git`.
 - [ ] Todo o código foi "commitado" e submetido (pushed) com sucesso para o repositório.
+
+## Follow-up — 2026-09-07T05:58:24Z
+
+Finalizar o desenvolvimento do ACS TR-369/USP (Rust-TR069) seguindo rigorosamente as orientações de continuidade definidas no `HANDOVER_STATUS.md`. O projeto requer finalizar o Milestone 2 (PostgreSQL) corrigindo o SQL da última iteração, implementar o Milestone 3 (Rust USP Core Worker) baseado nas pesquisas pré-existentes, implementar o Milestone 4 (Python FastAPI Manager) e concluir a escrita do `README.md`.
+
+Working directory: /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069
+Integrity mode: development
+
+## Requirements
+
+### R1. Corrigir o Banco de Dados Híbrido (Milestone 2)
+Ajustar `postgres/init.sql` garantindo que:
+- O `CREATE TABLESPACE` não seja executado dentro de blocos transacionais (como `DO $$`).
+- A trigger de reconciliação de histórico seja acionada estritamente quando a variação ótica for > 1.0 dBm, inserindo no histórico sem dar `UPDATE` na tabela `cpe_inventory`, evitando amplificação de I/O em disco.
+
+### R2. Implementar o Core Worker MTP em Rust (Milestone 3)
+Desenvolver a aplicação na pasta `rust-core/` consumindo as especificações do `HANDOVER_STATUS.md` e do Handoff de pesquisa (`.agents/spec_miner_usp_1/handoff.md`). Deve usar runtime assíncrono Tokio, fila MPSC e SQLx, decodificando Protobuf proveniente de tópicos MQTT.
+
+### R3. Implementar o Manager API Controller em Python (Milestone 4)
+Desenvolver a API assíncrona na pasta `python-api/` usando Python 3.11, FastAPI e SQLAlchemy 2.0 (assíncrono). A API deve ter isolamento de threads por Gunicorn para contenção de memória, servindo dados e injetando comandos no MQTT.
+
+### R4. Finalizar o README.md
+O `README.md` do projeto deve ser atualizado. O Roadmap deve refletir a conclusão das etapas 3 e 4, e eventuais seções pendentes devem ser finalizadas ou removidas para refletir o estado de um projeto pronto para execução.
+
+## Acceptance Criteria
+
+### Funcional e Infraestrutura
+- [ ] O contêiner do Postgres inicializa corretamente, monta a tablespace em RAM, e o SQL passa nos testes de validação (`test_schema.py` / `test_reconciliation_empirical.py`).
+- [ ] Todo o projeto inicia em cascata sem erros utilizando `docker compose up -d --build`.
+
+### Verificação Integrada (Ponta a Ponta)
+- [ ] Executar o script principal fornecido `./simulate_flow.sh` e ele deve passar com sucesso e exit code 0. Ele garante que um dispositivo foi cadastrado na API (M4), emitiu eventos no broker, o core (M3) leu o broker e processou, salvou na RAM no Postgres (M2), a API consultou com sucesso e ativou um comando reverso no MQTT.
+

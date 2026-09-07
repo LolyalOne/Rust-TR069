@@ -513,6 +513,7 @@ TELEMETRY_PAYLOAD=$(cat <<EOF
   "cpe_id": "${CPE_ID}",
   "status": "online",
   "metrics": {
+    "rx_optical_power": -18.5,
     "cpu_usage": 42.5,
     "memory_usage": 68.0,
     "rx_bytes": 1048576,
@@ -596,6 +597,7 @@ MODIFIED_TELEMETRY=$(cat <<EOF
   "cpe_id": "${CPE_ID}",
   "status": "online",
   "metrics": {
+    "rx_optical_power": -21.0,
     "cpu_usage": 88.4,
     "memory_usage": 75.2,
     "rx_bytes": 2097152,
