@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+target/
+Cargo.lock
+*.env
+.env
+mosquitto_data/
+pg_data/

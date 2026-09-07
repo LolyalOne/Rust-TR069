@@ -1,0 +1,108 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: acs_db
+      POSTGRES_USER: acs_user
+      POSTGRES_PASSWORD: acs_password
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    tmpfs:
+      - /var/lib/postgresql/ram_data:uid=70,gid=70,mode=0700,size=1G
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acs_user -d acs_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - acs_network
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - mosquitto_data:/mosquitto/data
+    ports:
+      - "1883:1883"
+    deploy:
+      resources:
+        limits:
+          memory: 500M
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_pub -h localhost -t 'probe/health' -m '1' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - acs_network
+
+  rust-core:
+    build:
+      context: ./rust-core
+    environment:
+      - DATABASE_URL=postgres://acs_user:acs_password@postgres:5432/acs_db
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 500M
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - acs_network
+
+  python-api:
+    build:
+      context: ./python-api
+    volumes:
+      - .:/workspace:cached
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://acs_user:acs_password@postgres:5432/acs_db
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - acs_network
+
+volumes:
+  pg_data:
+  mosquitto_data:
+
+networks:
+  acs_network:
+    driver: bridge

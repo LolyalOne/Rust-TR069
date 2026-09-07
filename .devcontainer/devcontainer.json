@@ -1,0 +1,25 @@
+{
+  "name": "ACS Distribuido Dev Container",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "python-api",
+  "workspaceFolder": "/workspace",
+  "features": {
+    "ghcr.io/devcontainers/features/rust:1": {},
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-azuretools.vscode-docker",
+        "tamasfe.even-better-toml"
+      ],
+      "settings": {
+        "python.formatting.provider": "black",
+        "editor.formatOnSave": true
+      }
+    }
+  }
+}
