@@ -1,21 +1,33 @@
 use anyhow::{anyhow, Context, Result};
+use axum::{
+    body::Bytes,
+    extract::{ConnectInfo, State},
+    http::{header, HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::post,
+    Router,
+};
 use chrono::{DateTime, Utc};
 use prost::Message;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::watch;
+use tokio::sync::{watch, RwLock};
 
 // Include Protobuf generated definitions compiled by prost_build in build.rs
 pub mod usp {
     include!(concat!(env!("OUT_DIR"), "/usp.rs"));
 }
+
+pub mod cwmp;
 
 // -----------------------------------------------------------------------------
 // Domain Models
@@ -672,6 +684,343 @@ pub async fn run_mqtt_ingest(
 }
 
 // -----------------------------------------------------------------------------
+// CWMP TR-069 Axum Embedded Server & Session Handling
+// -----------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct AppState {
+    pub tx: Sender<TelemetryUpdate>,
+    pub db_pool: PgPool,
+    pub session_cache: Arc<RwLock<HashMap<std::net::IpAddr, (String, Instant)>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCommandRow {
+    pub id: String,
+    pub command_type: String,
+    pub command_payload: JsonValue,
+}
+
+pub async fn dequeue_pending_command(
+    pool: &PgPool,
+    cpe_id: &str,
+) -> Result<Option<PendingCommandRow>> {
+    let mut tx = pool.begin().await?;
+
+    let row: Option<(String, String, JsonValue)> = sqlx::query_as(
+        r#"
+        SELECT id::text AS id, command_type, command_payload
+        FROM cpe_pending_commands
+        WHERE cpe_id = $1 AND status = 'pending'
+        ORDER BY created_at ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+        "#,
+    )
+    .bind(cpe_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((id, command_type, command_payload)) = row {
+        sqlx::query(
+            r#"
+            UPDATE cpe_pending_commands
+            SET status = 'dispatched', dispatched_at = CURRENT_TIMESTAMP
+            WHERE id = $1::uuid
+            "#,
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(PendingCommandRow {
+            id,
+            command_type,
+            command_payload,
+        }))
+    } else {
+        tx.commit().await?;
+        Ok(None)
+    }
+}
+
+pub fn build_soap_rpc_for_command(cmd: &PendingCommandRow) -> String {
+    let cmd_type = cmd.command_type.to_lowercase();
+    if cmd_type.contains("reboot") {
+        let command_key = cmd
+            .command_payload
+            .get("command_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&cmd.id);
+        cwmp::generate_reboot_rpc(&cmd.id, command_key)
+    } else if cmd_type.contains("getparam") || cmd_type.contains("parameter") {
+        let mut names = Vec::new();
+        if let Some(arr) = cmd.command_payload.get("parameter_names").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    names.push(s.to_string());
+                }
+            }
+        } else if let Some(arr) = cmd.command_payload.get("names").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    names.push(s.to_string());
+                }
+            }
+        }
+        if names.is_empty() {
+            names.push("Device.DeviceInfo.SoftwareVersion".to_string());
+        }
+        cwmp::generate_get_parameter_values_rpc(&cmd.id, &names)
+    } else {
+        let command_key = cmd
+            .command_payload
+            .get("command_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&cmd.id);
+        cwmp::generate_reboot_rpc(&cmd.id, command_key)
+    }
+}
+
+async fn resolve_cpe_id(
+    headers: &HeaderMap,
+    client_ip: std::net::IpAddr,
+    state: &AppState,
+) -> Option<String> {
+    if let Some(cookie_hdr) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        for cookie in cookie_hdr.split(';') {
+            let cookie = cookie.trim();
+            if let Some(val) = cookie.strip_prefix("session=") {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    {
+        let cache = state.session_cache.read().await;
+        if let Some((cpe_id, instant)) = cache.get(&client_ip) {
+            if instant.elapsed() < Duration::from_secs(120) {
+                return Some(cpe_id.clone());
+            }
+        }
+    }
+
+    let ip_str = client_ip.to_string();
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT cpe_id FROM cpe_live_state WHERE ip_address = $1 ORDER BY last_seen DESC LIMIT 1"
+    )
+    .bind(&ip_str)
+    .fetch_optional(&state.db_pool)
+    .await
+    .unwrap_or(None);
+
+    row.map(|(id,)| id)
+}
+
+pub async fn handle_cwmp_post(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let client_ip = addr.ip();
+
+    // 1. Check for Empty POST (ACS Command Phase)
+    if body.is_empty() {
+        tracing::debug!(%client_ip, "Received empty CWMP POST");
+        if let Some(cpe_id) = resolve_cpe_id(&headers, client_ip, &state).await {
+            match dequeue_pending_command(&state.db_pool, &cpe_id).await {
+                Ok(Some(cmd)) => {
+                    tracing::info!(%cpe_id, command_id = %cmd.id, command_type = %cmd.command_type, "Dispatching pending command to CPE");
+                    let rpc_xml = build_soap_rpc_for_command(&cmd);
+                    let mut resp_headers = HeaderMap::new();
+                    resp_headers.insert(header::CONTENT_TYPE, "text/xml; charset=utf-8".parse().unwrap());
+                    resp_headers.insert(header::SERVER, "Rust-TR069-ACS/1.0".parse().unwrap());
+                    return (StatusCode::OK, resp_headers, rpc_xml).into_response();
+                }
+                Ok(None) => {
+                    tracing::debug!(%cpe_id, "No pending commands for CPE; terminating CWMP session");
+                    let mut resp_headers = HeaderMap::new();
+                    resp_headers.insert(header::CONTENT_LENGTH, "0".parse().unwrap());
+                    resp_headers.insert(header::SERVER, "Rust-TR069-ACS/1.0".parse().unwrap());
+                    return (StatusCode::OK, resp_headers, "").into_response();
+                }
+                Err(e) => {
+                    tracing::error!(%cpe_id, error = %e, "Failed to query pending commands");
+                    let mut resp_headers = HeaderMap::new();
+                    resp_headers.insert(header::CONTENT_LENGTH, "0".parse().unwrap());
+                    resp_headers.insert(header::SERVER, "Rust-TR069-ACS/1.0".parse().unwrap());
+                    return (StatusCode::INTERNAL_SERVER_ERROR, resp_headers, "").into_response();
+                }
+            }
+        } else {
+            tracing::warn!(%client_ip, "Empty POST received but cannot resolve CPE session");
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert(header::CONTENT_LENGTH, "0".parse().unwrap());
+            resp_headers.insert(header::SERVER, "Rust-TR069-ACS/1.0".parse().unwrap());
+            return (StatusCode::OK, resp_headers, "").into_response();
+        }
+    }
+
+    let xml_str = String::from_utf8_lossy(&body);
+
+    // 2. Check if Inform
+    if xml_str.contains("Inform") {
+        match cwmp::parse_inform(&xml_str) {
+            Ok(parsed) => {
+                let cpe_id = parsed.cpe_id.clone();
+                let header_id = parsed.header_id.clone();
+
+                {
+                    let mut cache = state.session_cache.write().await;
+                    cache.insert(client_ip, (cpe_id.clone(), Instant::now()));
+                }
+
+                let update = parsed.into_telemetry_update(Some(client_ip.to_string()));
+
+                match tokio::time::timeout(Duration::from_millis(500), state.tx.send(update)).await {
+                    Ok(Ok(())) => {
+                        tracing::info!(%cpe_id, "Enqueued CWMP Inform telemetry into MPSC channel");
+                    }
+                    Ok(Err(_)) => {
+                        tracing::warn!(%cpe_id, "MPSC channel closed during CWMP Inform ingestion");
+                    }
+                    Err(_) => {
+                        tracing::warn!(%cpe_id, "MPSC channel saturated (>500ms); dropping update to preserve CWMP response");
+                    }
+                }
+
+                let resp_xml = cwmp::generate_inform_response(&header_id);
+                let cookie_val = format!("session={}; Path=/; HttpOnly", cpe_id);
+
+                let mut resp_headers = HeaderMap::new();
+                resp_headers.insert(header::CONTENT_TYPE, "text/xml; charset=utf-8".parse().unwrap());
+                if let Ok(cookie_hv) = cookie_val.parse() {
+                    resp_headers.insert(header::SET_COOKIE, cookie_hv);
+                }
+                resp_headers.insert(header::SERVER, "Rust-TR069-ACS/1.0".parse().unwrap());
+
+                return (StatusCode::OK, resp_headers, resp_xml).into_response();
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to parse CWMP Inform XML");
+                let fault_xml = cwmp::build_soap_fault("Client", "Invalid CWMP Inform XML", None);
+                let mut resp_headers = HeaderMap::new();
+                resp_headers.insert(header::CONTENT_TYPE, "text/xml; charset=utf-8".parse().unwrap());
+                resp_headers.insert(header::SERVER, "Rust-TR069-ACS/1.0".parse().unwrap());
+                return (StatusCode::OK, resp_headers, fault_xml).into_response();
+            }
+        }
+    }
+
+    // 3. Check if RPC Response or Fault from ONT
+    if xml_str.contains("Response") || xml_str.contains("Fault") {
+        let cpe_id = resolve_cpe_id(&headers, client_ip, &state).await;
+        tracing::info!(?cpe_id, "Received CWMP RPC Response or Fault from CPE");
+
+        if let Some(ref cid) = cpe_id {
+            let (cmd_status, result_payload) = if xml_str.contains("Fault") {
+                ("failed", json!({ "raw_response": xml_str.to_string(), "status": "fault" }))
+            } else if xml_str.contains("RebootResponse") {
+                ("completed", json!({ "status": "reboot_acknowledged" }))
+            } else if xml_str.contains("GetParameterValuesResponse") {
+                let mut params = serde_json::Map::new();
+                if let Ok(doc) = roxmltree::Document::parse(&xml_str) {
+                    for pvs in doc.descendants().filter(|n| n.tag_name().name() == "ParameterValueStruct") {
+                        if let (Some(n), Some(v)) = (
+                            pvs.children().find(|c| c.tag_name().name() == "Name").and_then(|c| c.text()),
+                            pvs.children().find(|c| c.tag_name().name() == "Value").and_then(|c| c.text()),
+                        ) {
+                            params.insert(n.to_string(), JsonValue::String(v.to_string()));
+                        }
+                    }
+                }
+                ("completed", json!({ "parameters": params }))
+            } else {
+                ("completed", json!({ "status": "completed", "raw_response": xml_str.to_string() }))
+            };
+
+            let update_res = sqlx::query(
+                r#"
+                UPDATE cpe_pending_commands
+                SET status = $2, completed_at = CURRENT_TIMESTAMP, result_payload = $3
+                WHERE id = (
+                    SELECT id FROM cpe_pending_commands
+                    WHERE cpe_id = $1 AND status = 'dispatched'
+                    ORDER BY dispatched_at DESC NULLS LAST, created_at DESC
+                    LIMIT 1
+                )
+                "#,
+            )
+            .bind(cid)
+            .bind(cmd_status)
+            .bind(result_payload)
+            .execute(&state.db_pool)
+            .await;
+
+            if let Err(e) = update_res {
+                tracing::warn!(error = %e, %cid, "Failed to update dispatched command status in DB");
+            }
+
+            if let Ok(Some(next_cmd)) = dequeue_pending_command(&state.db_pool, cid).await {
+                tracing::info!(%cid, next_command_id = %next_cmd.id, "Dispatching subsequent pending command");
+                let rpc_xml = build_soap_rpc_for_command(&next_cmd);
+                let mut resp_headers = HeaderMap::new();
+                resp_headers.insert(header::CONTENT_TYPE, "text/xml; charset=utf-8".parse().unwrap());
+                resp_headers.insert(header::SERVER, "Rust-TR069-ACS/1.0".parse().unwrap());
+                return (StatusCode::OK, resp_headers, rpc_xml).into_response();
+            }
+        }
+
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(header::CONTENT_LENGTH, "0".parse().unwrap());
+        resp_headers.insert(header::SERVER, "Rust-TR069-ACS/1.0".parse().unwrap());
+        return (StatusCode::OK, resp_headers, "").into_response();
+    }
+
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(header::CONTENT_LENGTH, "0".parse().unwrap());
+    resp_headers.insert(header::SERVER, "Rust-TR069-ACS/1.0".parse().unwrap());
+    (StatusCode::OK, resp_headers, "").into_response()
+}
+
+pub async fn run_cwmp_server(
+    listener: tokio::net::TcpListener,
+    state: AppState,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    let app = Router::new()
+        .route("/", post(handle_cwmp_post))
+        .route("/cwmp", post(handle_cwmp_post))
+        .route("/tr069", post(handle_cwmp_post))
+        .with_state(state);
+
+    let shutdown_signal = async move {
+        while shutdown_rx.changed().await.is_ok() {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+        }
+    };
+
+    tracing::info!("Starting Axum TR-069 CWMP server");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal)
+    .await
+    .context("CWMP Axum server encountered fatal error")?;
+
+    tracing::info!("CWMP HTTP Server shutdown cleanly");
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
 // Main Application Bootstrap
 // -----------------------------------------------------------------------------
 
@@ -684,7 +1033,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    tracing::info!("Starting TR-369 / USP Rust Core Worker Engine");
+    tracing::info!("Starting Dual-Stack TR-369 / TR-069 Rust Core Worker Engine");
 
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://acs_user:acs_password@postgres:5432/acs_db".to_string());
@@ -697,6 +1046,19 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "1024".to_string())
         .parse()
         .unwrap_or(1024);
+
+    let cwmp_host = std::env::var("CWMP_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let cwmp_port: u16 = std::env::var("CWMP_PORT")
+        .unwrap_or_else(|_| "7547".to_string())
+        .parse()
+        .unwrap_or(7547);
+    let cwmp_addr = format!("{}:{}", cwmp_host, cwmp_port);
+
+    // Bind CWMP listener early
+    let cwmp_listener = tokio::net::TcpListener::bind(&cwmp_addr)
+        .await
+        .with_context(|| format!("Failed to bind CWMP HTTP server to {}", cwmp_addr))?;
+    tracing::info!(addr = %cwmp_addr, "Bound CWMP HTTP Server listener");
 
     // Connect to PostgreSQL with retry
     let mut db_pool = None;
@@ -729,6 +1091,13 @@ async fn main() -> Result<()> {
     let (tx, rx) = channel::<TelemetryUpdate>(channel_capacity);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    let axum_tx = tx.clone();
+    let app_state = AppState {
+        tx: axum_tx,
+        db_pool: db_pool.clone(),
+        session_cache: Arc::new(RwLock::new(HashMap::new())),
+    };
+
     // Spawn Health Monitor Task
     let health_handle = tokio::spawn(run_healthcheck_monitor(
         health.clone(),
@@ -743,7 +1112,7 @@ async fn main() -> Result<()> {
         health.clone(),
     ));
 
-    // Spawn MQTT Ingest Task
+    // Spawn MQTT Ingest Task (moves tx into task)
     let mqtt_handle = tokio::spawn(run_mqtt_ingest(
         mqtt_host,
         mqtt_port,
@@ -753,13 +1122,20 @@ async fn main() -> Result<()> {
         shutdown_rx.clone(),
     ));
 
+    // Spawn Axum CWMP Server Task (moves app_state into task)
+    let cwmp_handle = tokio::spawn(run_cwmp_server(
+        cwmp_listener,
+        app_state,
+        shutdown_rx.clone(),
+    ));
+
     // Wait for termination signal
     tokio::signal::ctrl_c().await.context("Failed to listen for ctrl_c signal")?;
     tracing::info!("Received shutdown signal. Initiating graceful shutdown...");
     let _ = shutdown_tx.send(true);
 
-    let _ = tokio::join!(mqtt_handle, db_handle, health_handle);
-    tracing::info!("TR-369 Rust Core Worker shutdown complete.");
+    let _ = tokio::join!(mqtt_handle, cwmp_handle, db_handle, health_handle);
+    tracing::info!("Dual-Stack TR-369 / TR-069 Rust Core Worker shutdown complete.");
 
     Ok(())
 }
@@ -1242,5 +1618,84 @@ mod tests {
         let u = res.unwrap();
         assert_eq!(u.cpe_id, "cpe-stress-01");
         assert_eq!(u.current_parameters.as_object().unwrap().len(), 3000);
+    }
+
+    #[test]
+    fn test_build_soap_rpc_dispatch_variants() {
+        let reboot_cmd = PendingCommandRow {
+            id: "cmd-uuid-1".to_string(),
+            command_type: "Reboot".to_string(),
+            command_payload: json!({
+                "command": "Reboot",
+                "command_key": "reboot-custom-key-1"
+            }),
+        };
+        let reboot_xml = build_soap_rpc_for_command(&reboot_cmd);
+        assert!(reboot_xml.contains("<cwmp:ID mustUnderstand=\"1\">cmd-uuid-1</cwmp:ID>"));
+        assert!(reboot_xml.contains("<CommandKey>reboot-custom-key-1</CommandKey>"));
+
+        let gpv_cmd = PendingCommandRow {
+            id: "cmd-uuid-2".to_string(),
+            command_type: "GetParameterValues".to_string(),
+            command_payload: json!({
+                "parameter_names": [
+                    "Device.DeviceInfo.SoftwareVersion",
+                    "Device.Optical.Interface.1.OpticalSignalLevel"
+                ]
+            }),
+        };
+        let gpv_xml = build_soap_rpc_for_command(&gpv_cmd);
+        assert!(gpv_xml.contains("<cwmp:ID mustUnderstand=\"1\">cmd-uuid-2</cwmp:ID>"));
+        assert!(gpv_xml.contains("<string>Device.DeviceInfo.SoftwareVersion</string>"));
+        assert!(gpv_xml.contains("<string>Device.Optical.Interface.1.OpticalSignalLevel</string>"));
+
+        // Fallback names variant
+        let gpv_alt = PendingCommandRow {
+            id: "cmd-uuid-3".to_string(),
+            command_type: "GetParameterValues".to_string(),
+            command_payload: json!({
+                "names": ["Device.WiFi.Radio.1.Status"]
+            }),
+        };
+        let gpv_alt_xml = build_soap_rpc_for_command(&gpv_alt);
+        assert!(gpv_alt_xml.contains("<string>Device.WiFi.Radio.1.Status</string>"));
+    }
+
+    #[tokio::test]
+    async fn test_cwmp_session_and_telemetry_convergence() {
+        let (tx, mut rx) = channel::<TelemetryUpdate>(16);
+        let inform_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/" xmlns:cwmp="urn:dslforum-org:cwmp-1-0">
+  <SOAP-ENV:Header><cwmp:ID mustUnderstand="1">777</cwmp:ID></SOAP-ENV:Header>
+  <SOAP-ENV:Body>
+    <cwmp:Inform>
+      <DeviceId>
+        <Manufacturer>Huawei</Manufacturer>
+        <OUI>00259E</OUI>
+        <ProductClass>HG8245H</ProductClass>
+        <SerialNumber>HWTC12345678</SerialNumber>
+      </DeviceId>
+      <ParameterList>
+        <ParameterValueStruct>
+          <Name>InternetGatewayDevice.WANDevice.1.WANDSLInterfaceConfig.X_HW_OpticalRxPower</Name>
+          <Value>-19.50 dBm</Value>
+        </ParameterValueStruct>
+      </ParameterList>
+    </cwmp:Inform>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>"#;
+
+        let parsed = cwmp::parse_inform(inform_xml).expect("Parsing must succeed");
+        let update = parsed.into_telemetry_update(Some("10.0.0.1".to_string()));
+        tx.send(update).await.expect("Channel send must succeed");
+
+        let received = rx.recv().await.expect("Channel recv must succeed");
+        assert_eq!(received.cpe_id, "HWTC12345678");
+        assert_eq!(received.status, "online");
+        assert_eq!(
+            received.telemetry_metrics.get("rx_optical_power").and_then(|v| v.as_f64()),
+            Some(-19.50)
+        );
+        assert_eq!(received.ip_address, Some("10.0.0.1".to_string()));
     }
 }

@@ -124,3 +124,30 @@ Adicionar a exposição da porta `7547:7547` no serviço `rust-core` do `docker-
 - [ ] O contêiner Rust sobre com sucesso expondo a porta `7547` além da conexão MQTT.
 - [ ] Um comando `curl` simulando um payload XML de Inform da Huawei EchoLife na porta `7547` resulta no salvamento correto dos dados na memória volátil (`cpe_live_state`) do banco.
 - [ ] Todos os testes unitários anteriores e o script `simulate_flow.sh` continuam funcionando para a parte MQTT.
+
+## Follow-up — 2026-09-07T19:13:17Z
+
+# Retomada Refatoração Dual-Stack (Milestone 2)
+
+O agente anterior concluiu o Milestone 1 inteiro (Docker Compose, banco de dados `cpe_pending_commands`, modelos no FastAPI e schemas seguros), mas foi interrompido por um limite de quota da nuvem.
+
+O seu objetivo agora é assumir a partir do **Milestone 2** e terminá-lo!
+
+Working directory: /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069
+
+## Requirements Pendentes
+
+### R1. Implementar Servidor HTTP (CWMP) no Rust Core
+Modificar `rust-core/src/main.rs` para rodar, junto com o cliente MQTT (Tokio), um servidor web embarcado (usando `axum` ou `actix-web`) escutando na porta `7547` (Padrão TR-069).
+
+### R2. Parsing de XML/SOAP (TR-069 Inform)
+O servidor Rust deve receber as requisições `POST` das ONTs legadas contendo pacotes XML/SOAP (`<SOAP-ENV:Envelope>`, `<cwmp:Inform>`). Extrair os metadados principais (Número de Série, Fabricante, e parâmetros TR-181) utilizando uma biblioteca de XML (ex: `roxmltree` ou `quick-xml`).
+
+### R3. Convergência MPSC e Fila
+Os dados extraídos do XML devem ser enviados para a **mesma fila MPSC** que processa o MQTT. Além disso, o Rust Core deve consultar os comandos pendentes (que a API Python escreve no PostgreSQL) e retorná-los na resposta XML da requisição HTTP (ex: `GetParameterValues`).
+
+## Acceptance Criteria
+- [ ] O `rust-core` compila sem erros com `axum` e a lib de XML.
+- [ ] A porta `7547` está ativa e aceitando POSTs.
+- [ ] Os testes unitários antigos funcionam.
+

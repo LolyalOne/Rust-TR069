@@ -1,7 +1,7 @@
-# BRIEFING — 2026-09-07T14:20:33Z
+# BRIEFING — 2026-09-07T19:14:50Z
 
 ## Mission
-Coordinate, monitor, and independently audit the Dual-Stack TR-069 Clássico (CWMP/XML port 7547) and TR-369 (USP/MQTT) refactoring execution by the Project Orchestrator.
+Coordinate, monitor, and independently audit the Dual-Stack TR-069 Clássico (CWMP/XML port 7547) and TR-369 (USP/MQTT) refactoring execution (Milestone 2) by the Project Orchestrator.
 
 ## 🔒 My Identity
 - Archetype: sentinel
@@ -11,6 +11,7 @@ Coordinate, monitor, and independently audit the Dual-Stack TR-069 Clássico (CW
 - Working directory (resumed): /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/sentinel_1
 - Orchestrator 2: 72558cd4-b522-4129-816f-63bb0c581dfa
 - Orchestrator 4 (Dual-Stack): bc13128e-ef20-4f80-a5ee-3baf13742122
+- Orchestrator 5 (Dual-Stack Milestone 2): 080afe73-e1b3-461b-a656-3451e9e7e35d
 
 ## 🔒 Key Constraints
 - No technical decisions — relay only
@@ -20,18 +21,18 @@ Coordinate, monitor, and independently audit the Dual-Stack TR-069 Clássico (CW
 - Clean up all crons and subagents upon verified completion
 
 ## User Context
-- **Last user request**: Refatoração Dual-Stack TR-069 Clássico (CWMP HTTP/XML na porta 7547) e TR-369 (USP/MQTT).
+- **Last user request**: Retomada da Refatoração Dual-Stack a partir do Milestone 2 (Servidor HTTP CWMP na porta 7547, parsing de XML/SOAP Inform, convergência MPSC e fila de comandos).
 - **Pending clarifications**: none
-- **Delivered results**: USP/MQTT full stack completed in prior milestones.
+- **Delivered results**: Milestone 1 concluído anteriormente (Docker Compose, `cpe_pending_commands`, modelos FastAPI).
 
 ## Project Status
-- **Phase**: in progress (orchestrator_4 dispatched and executing Dual-Stack refactoring)
-- **Cron 1 (Progress)**: task-40 (*/8 * * * *)
-- **Cron 2 (Liveness)**: task-42 (*/10 * * * *)
+- **Phase**: in progress (orchestrator_5 dispatched for Milestone 2)
+- **Cron 1 (Progress)**: task-46 (*/8 * * * *)
+- **Cron 2 (Liveness)**: task-48 (*/10 * * * *)
 
 ## Routing Decision
 - **Route**: General (`teamwork_preview_orchestrator`)
-- **Rationale**: Multi-component architectural feature across Rust Core, PostgreSQL, Python FastAPI, Docker Compose, and E2E verification.
+- **Rationale**: Multi-component architectural feature across Rust Core (`axum`, `roxmltree`), PostgreSQL query integration, and MPSC channel convergence requiring specialist swarm.
 
 ## Victory Audit Status
 - **Triggered**: no
@@ -43,9 +44,6 @@ Coordinate, monitor, and independently audit the Dual-Stack TR-069 Clássico (CW
 - /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/ORIGINAL_REQUEST.md — Authoritative verbatim user request (.agents)
 - /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/HANDOVER_STATUS.md — Continuous development guidance & milestone status
 - /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/sentinel_1/BRIEFING.md — Sentinel persistent working memory
-- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/orchestrator_1/ — Previous Orchestrator workspace & handoff
-- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/orchestrator_2/ — Active Project Orchestrator workspace
-- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/spec_miner_usp_1/handoff.md — Spec miner TR-369 research handoff
-- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/docker-compose.yml — Docker compose with strict memory limits & tmpfs
-- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/postgres/init.sql — Hybrid PostgreSQL schema & triggers
-- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/simulate_flow.sh — Automated E2E verification test harness
+- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/orchestrator_5/ — Active Project Orchestrator workspace (Milestone 2)
+- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/orchestrator_4/ — Previous Orchestrator workspace (Milestone 1)
+- /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/rust-core/ — Rust core service codebase
