@@ -105,7 +105,8 @@ graph TD
 * **Canal Tokio MPSC com Bounded Backpressure (1024 mensagens):** Desacopla estritamente a thread de rede MQTT do loop de persistência no PostgreSQL. As mensagens são enfileiradas com timeout de guarda (500 ms) para impedir que lentidões transientes no banco bloqueiem o *keep-alive* do MQTT (`PINGREQ`).
 * **Assinatura Rumqttc e Prevenção de Loops de Feedback:** Assina `usp/endpoint/#` com QoS 1 e descarta ativamente tópicos terminados em `/request` (comandos do Controller), evitando auto-ingestão e loops infinitos de mensagens.
 * **Upsert Atômico com Concatenação JSONB (`||`):** Atualiza `current_parameters` e `telemetry_metrics` incrementalmente utilizando o operador nativo `||` do PostgreSQL, preservando parâmetros existentes reportados em mensagens anteriores. Auto-provisiona dispositivos não registrados previamente (`ON CONFLICT (cpe_id) DO NOTHING`).
-* **Footprint Mínimo e Multi-Stage Build:** Compilado em container Alpine multi-stage (`rust:alpine` $ightarrow$ `alpine:latest`), gerando um executável enxuto de ~3.9 MB com consumo em execução **menor que 30 MB de RAM**.
+* **Footprint Mínimo e Multi-Stage Build:** Compilado em container Alpine multi-stage (`rust:alpine` $
+ightarrow$ `alpine:latest`), gerando um executável enxuto de ~3.9 MB com consumo em execução **menor que 30 MB de RAM**.
 * **Monitoramento de Saúde (`/tmp/healthy`):** Tarefa assíncrona dedicada que sonda periodicamente o broker Mosquitto e executa `SELECT 1` no banco, mantendo o arquivo de healthcheck atualizado para o Docker.
 
 ### 3. Manager API & SDN Controller (`python-api`)
@@ -179,6 +180,35 @@ graph TD
 ```
 
 ---
+
+
+## ⚙️ Configuração do Ambiente (Variáveis e Credenciais)
+
+O sistema foi desenhado para rodar *"out-of-the-box"* com configurações padrão para facilitar o desenvolvimento. No entanto, para ambientes de produção ou customizados, você deve configurar as credenciais do Banco de Dados e do broker MQTT.
+
+A API em Python utiliza o `pydantic-settings` e suporta carregamento automático de variáveis via arquivo `.env`. O `docker-compose.yml` também herda essas variáveis se declaradas localmente.
+
+### Principais Variáveis Disponíveis
+
+| Variável | Valor Padrão (Desenvolvimento) | Descrição |
+|----------|--------------------------------|-----------|
+| `POSTGRES_DB` | `acs_db` | Nome do banco de dados |
+| `POSTGRES_USER` | `acs_user` | Usuário do banco PostgreSQL |
+| `POSTGRES_PASSWORD` | `acs_password` | Senha do banco PostgreSQL |
+| `DATABASE_URL` | `postgresql+asyncpg://acs_user:acs_password@postgres:5432/acs_db` | URL de conexão completa usada pelas aplicações (Rust e Python) |
+| `MQTT_HOST` | `mosquitto` | Hostname ou IP do broker MQTT |
+| `MQTT_PORT` | `1883` | Porta de comunicação do MQTT |
+| `DEBUG` | `False` | Habilita logs mais detalhados na API FastAPI |
+
+### Como Alterar as Configurações
+
+1. Crie um arquivo `.env` na raiz do projeto (mesmo diretório do `docker-compose.yml`):
+   ```env
+   POSTGRES_USER=admin_isp
+   POSTGRES_PASSWORD=senha_super_segura
+   DATABASE_URL=postgresql+asyncpg://admin_isp:senha_super_segura@postgres:5432/acs_db
+   ```
+2. Caso altere as credenciais, lembre-se de atualizar os valores correspondentes dentro do `docker-compose.yml` nas seções `environment` de cada serviço, ou utilize a interpolação do próprio Docker Compose (ex: `POSTGRES_USER=${POSTGRES_USER}`).
 
 ## 🚀 Guia de Execução e Testes
 
