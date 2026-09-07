@@ -17,7 +17,7 @@
 
 O gerenciamento tradicional de dispositivos de telecomunicações (CPEs, ONUs, OLTs, Roteadores Wi-Fi 6) esteve preso por mais de uma década às limitações do protocolo legado **TR-069 (CWMP)**: sessões SOAP/XML pesadas sobre HTTP síncrono, alto consumo de banda, polling ineficiente e latência inaceitável para tomada de decisão em tempo real.
 
-O **Rust-TR069 (USP ACS)** nasce para quebrar esse paradigma. Projetado do zero sob a especificação **TR-369 (User Services Platform - USP)** da *Broadband Forum (BBF)*, este sistema introduz uma **Arquitetura Orientada a Eventos (Event-Driven)** ultrarrápida, resiliente e escalável sobre o broker **MQTT**:
+O **Rust-TR069 (Dual-Stack ACS)** nasce para resolver os dois maiores desafios dos ISPs hoje: **suportar o gigantesco parque de roteadores legados** (Huawei EchoLife, TP-Link EX, ZTE) via **TR-069 Clássico (CWMP/HTTP)** e, simultaneamente, preparar a rede para o futuro através do protocolo **TR-369 (USP/MQTT)**. Tudo convergindo para um único núcleo de processamento:
 
 * ⚡ **De Segundos para Milissegundos:** Telemetria em tempo real compactada em **Protocol Buffers (Protobuf)** trafegando via tópicos MQTT.
 * 🛡️ **Segurança de Memória e Concorrência Extrema:** O núcleo de processamento MTP é forjado em **Rust puro** com runtime assíncrono Tokio, canal MPSC de desacoplamento e isolamento com backpressure.
@@ -31,62 +31,43 @@ O **Rust-TR069 (USP ACS)** nasce para quebrar esse paradigma. Projetado do zero 
 
 ```mermaid
 graph TD
-    subgraph "Borda / Dispositivos (CPEs)"
-        CPE1["ONU / Roteador Wi-Fi (CPE 1)"]
-        CPE2["ONU / Roteador Wi-Fi (CPE 2)"]
-        CPEn["Dispositivo TR-369 (CPE n)"]
+    subgraph "Parque de Dispositivos (CPEs)"
+        CPE_LEGACY["Huawei / TP-Link (TR-069 Clássico)"]
+        CPE_NEXT["Roteadores Wi-Fi 6 (TR-369 USP)"]
     end
 
-    subgraph "Broker MTP (Eclipse Mosquitto 1883)"
-        TOPIC_IN["usp/endpoint/{cpe_id}/notify<br/>usp/endpoint/{cpe_id}/telemetry"]
-        TOPIC_OUT["usp/endpoint/{cpe_id}/request"]
+    subgraph "Broker MTP (Eclipse Mosquitto)"
+        TOPIC_IN["usp/endpoint/{cpe_id}/telemetry"]
     end
 
-    subgraph "MTP Core Worker (Rust Tokio)"
-        MQTT_CLI["Receptor Assíncrono rumqttc"]
-        MPSC["Canal Tokio MPSC<br/>(Buffer Bounded: 1024)"]
-        PROST["Decodificador Dual (Protobuf BBF + JSON)"]
-        DB_SINK["Sink SQLx Atômico (JSONB Concatenation ||)"]
-        HEALTH_RUST["Healthcheck Monitor (/tmp/healthy)"]
+    subgraph "Core Worker Dual-Stack (Rust Tokio)"
+        HTTP_CWMP["Servidor Axum (Porta 7547)<br/>Parser XML/SOAP"]
+        MQTT_CLI["Receptor MQTT<br/>Parser Protobuf"]
+        MPSC["Canal Unificado Tokio MPSC<br/>(Buffer Bounded)"]
+        DB_SINK["Sink SQLx Atômico"]
     end
 
     subgraph "PostgreSQL 15 Híbrido"
-        RAM_TBL["Tier 1 (RAM tmpfs): cpe_live_state<br/>(UNLOGGED na ram_tablespace)"]
-        TRIGGER["Trigger: reconcile_live_to_history<br/>(Delta Óptico > 1.0 dBm)"]
-        DISK_TBL["Tier 2 (Disco): cpe_historical_metrics<br/>cpe_inventory (Persistente)"]
+        RAM_TBL["Tier 1 (RAM tmpfs): cpe_live_state"]
+        DISK_TBL["Tier 2 (Disco): cpe_inventory"]
     end
 
     subgraph "Manager & SDN Controller (FastAPI)"
         API["FastAPI Async Engine (Python 3.11)"]
-        GUNICORN["Gunicorn (2 Workers UvicornWorker)"]
-        PUB["Publicador MQTT Assíncrono (QoS 1)"]
     end
 
-    subgraph "Integrações Externas"
-        N8N["Automação ISP (n8n / CRM / ERP)"]
-        DASH["Frontend / Painel NOC / CLI"]
-    end
-
-    %% Fluxos Upstream (Telemetria)
-    CPE1 -->|Protobuf TR-369 / JSON| TOPIC_IN
-    CPE2 -->|Protobuf TR-369 / JSON| TOPIC_IN
-    CPEn -->|Protobuf TR-369 / JSON| TOPIC_IN
+    %% Fluxos Upstream
+    CPE_NEXT -->|"Telemetria Protobuf"| TOPIC_IN
     TOPIC_IN --> MQTT_CLI
-    MQTT_CLI -->|"Filtra /request"| MPSC
-    MPSC --> PROST
-    PROST --> DB_SINK
-    DB_SINK -->|"Zero-WAL Fast Write"| RAM_TBL
-    RAM_TBL -->|"Disparo sob Delta > 1.0 dBm"| TRIGGER
-    TRIGGER -->|"Gravação Histórica (Sem Update em Inventory)"| DISK_TBL
+    CPE_LEGACY -->|"HTTP POST (XML/SOAP Inform)"| HTTP_CWMP
+    
+    HTTP_CWMP -->|"Extração Padrão"| MPSC
+    MQTT_CLI -->|"Extração Padrão"| MPSC
+    MPSC --> DB_SINK
+    DB_SINK -->|"Gravação Otimizada"| RAM_TBL
 
-    %% Fluxos Downstream (Comandos)
-    DASH -->|"POST /api/v1/cpes/{id}/reboot"| API
-    N8N -->|POST /api/v1/cpes| API
-    API -->|"Consulta Microsegundos em RAM"| RAM_TBL
-    API --> GUNICORN
-    GUNICORN --> PUB
-    PUB -->|Comando TR-369 Reboot| TOPIC_OUT
-    TOPIC_OUT -->|Execução Remota| CPE1
+    %% Fluxos Downstream
+    API -->|"Consulta e Fila de Comandos"| RAM_TBL
 ```
 
 ---

@@ -1,7 +1,7 @@
-# BRIEFING — 2026-09-07T01:30:00Z
+# BRIEFING — 2026-09-07T14:20:33Z
 
 ## Mission
-Coordinate, monitor, and independently audit the TR-369/USP ACS project execution by the Project Orchestrator.
+Coordinate, monitor, and independently audit the Dual-Stack TR-069 Clássico (CWMP/XML port 7547) and TR-369 (USP/MQTT) refactoring execution by the Project Orchestrator.
 
 ## 🔒 My Identity
 - Archetype: sentinel
@@ -10,6 +10,7 @@ Coordinate, monitor, and independently audit the TR-369/USP ACS project executio
 - Victory Auditor: to be spawned on victory claim
 - Working directory (resumed): /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/sentinel_1
 - Orchestrator 2: 72558cd4-b522-4129-816f-63bb0c581dfa
+- Orchestrator 4 (Dual-Stack): bc13128e-ef20-4f80-a5ee-3baf13742122
 
 ## 🔒 Key Constraints
 - No technical decisions — relay only
@@ -19,19 +20,18 @@ Coordinate, monitor, and independently audit the TR-369/USP ACS project executio
 - Clean up all crons and subagents upon verified completion
 
 ## User Context
-- **Last user request**: Finalizar ACS TR-369/USP (Milestone 2 PostgreSQL fix, Milestone 3 Rust Core, Milestone 4 Python FastAPI, README.md, simulate_flow.sh pass).
+- **Last user request**: Refatoração Dual-Stack TR-069 Clássico (CWMP HTTP/XML na porta 7547) e TR-369 (USP/MQTT).
 - **Pending clarifications**: none
-- **Delivered results**: Milestone 1 complete; Milestone 2 partially done; Milestone 3 & 4 pending implementation.
+- **Delivered results**: USP/MQTT full stack completed in prior milestones.
 
 ## Project Status
-- **Phase**: in progress (orchestrator_2 dispatched and actively executing)
-- **Liveness**: Healthy
-- **Cron 1 (Progress)**: task-34
-- **Cron 2 (Liveness)**: task-36
+- **Phase**: in progress (orchestrator_4 dispatched and executing Dual-Stack refactoring)
+- **Cron 1 (Progress)**: task-40 (*/8 * * * *)
+- **Cron 2 (Liveness)**: task-42 (*/10 * * * *)
 
 ## Routing Decision
 - **Route**: General (`teamwork_preview_orchestrator`)
-- **Rationale**: Multi-milestone SWE task involving PostgreSQL DB fixes, Rust Core worker service, Python FastAPI manager service, documentation and E2E integration test.
+- **Rationale**: Multi-component architectural feature across Rust Core, PostgreSQL, Python FastAPI, Docker Compose, and E2E verification.
 
 ## Victory Audit Status
 - **Triggered**: no

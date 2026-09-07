@@ -235,3 +235,24 @@ CREATE TRIGGER reconcile_live_to_history
 AFTER INSERT OR UPDATE ON cpe_live_state
 FOR EACH ROW
 EXECUTE FUNCTION reconcile_live_to_history();
+
+-- ----------------------------------------------------------------------------
+-- 7. Persistent TR-069 Pending Commands Queue Table
+-- ----------------------------------------------------------------------------
+-- Stores queued CWMP RPC commands (Reboot, GetParameterValues, etc.)
+-- awaiting delivery during periodic Inform sessions.
+CREATE TABLE IF NOT EXISTS cpe_pending_commands (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cpe_id VARCHAR(128) NOT NULL REFERENCES cpe_inventory(cpe_id) ON DELETE CASCADE,
+    command_type VARCHAR(64) NOT NULL,
+    command_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    dispatched_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    result_payload JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_cpe_pending_commands_lookup
+ON cpe_pending_commands (cpe_id, status, created_at);
+

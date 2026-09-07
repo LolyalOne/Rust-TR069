@@ -1,7 +1,7 @@
-# BRIEFING — 2026-09-07T01:05:40Z
+# BRIEFING — 2026-09-07T14:55:00Z
 
 ## Mission
-Adversarially and objectively review Milestone 1 infrastructure files (docker-compose.yml, devcontainer.json, configure_limits.py) and issue an evidence-based verdict.
+Adversarially and objectively review Milestone 1 (Dual-Stack TR-069/TR-369 Infra & Data Layer) changes made by worker_m1_dualstack across docker-compose.yml, postgres/init.sql, python-api/app/models.py, schemas.py, routers/cpes.py, and tests.
 
 ## 🔒 My Identity
 - Archetype: teamwork_preview_reviewer
@@ -10,52 +10,74 @@ Adversarially and objectively review Milestone 1 infrastructure files (docker-co
 - Original parent: 6258e12c-9553-47a2-9624-69521a0b2d82
 - Milestone: Milestone 1
 - Instance: 2 of 2
+- Working directory (current): /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/reviewer_m1_2
+- Current parent: bc13128e-ef20-4f80-a5ee-3baf13742122
+- Current Milestone: Milestone 1 (Dual-Stack TR-069 / TR-369 Refactor)
 
 ## 🔒 Key Constraints
 - Review-only — do NOT modify implementation code
 - Report findings objectively and adversarially
 - Must verify YAML schema validity and test presets/limits
 - Must write handoff report to /mnt/d/Projetos/TR069-181/.agents/reviewer_m1_2/handoff.md
+- Review-only — do NOT modify implementation code
+- Actively check for integrity violations (hardcoded test results, facade implementations, shortcuts, fabricated verification)
+- Independently verify all interface contracts and test suites
+- Write final review report to /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/reviewer_m1_2/handoff.md
+- Report verdict (APPROVE or REQUEST_CHANGES) via send_message to parent
 
 ## Current Parent
-- Conversation ID: 6258e12c-9553-47a2-9624-69521a0b2d82
-- Updated: not yet
+- Conversation ID: bc13128e-ef20-4f80-a5ee-3baf13742122
+- Updated: 2026-09-07T14:55:00Z
 
 ## Review Scope
 - **Files to review**:
-  - /mnt/d/Projetos/TR069-181/docker-compose.yml
-  - /mnt/d/Projetos/TR069-181/.devcontainer/devcontainer.json
-  - /mnt/d/Projetos/TR069-181/configure_limits.py
-- **Interface contracts**: /mnt/d/Projetos/TR069-181/ORIGINAL_REQUEST.md, /mnt/d/Projetos/TR069-181/.agents/orchestrator_1/PROJECT.md
-- **Review criteria**: Correctness, YAML schema validity, edge case handling, CLI usability, safety/integrity
+  - `docker-compose.yml`
+  - `postgres/init.sql`
+  - `python-api/app/models.py`
+  - `python-api/app/schemas.py`
+  - `python-api/app/routers/cpes.py`
+  - `python-api/tests/test_api.py`
+- **Interface contracts**:
+  - `/mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/orchestrator_4/PROJECT.md`
+  - `/mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/ORIGINAL_REQUEST.md`
+- **Review criteria**:
+  - Conformance with PROJECT.md architecture & database schema (`cpe_pending_commands`)
+  - Backward compatibility of `reboot_cpe` with TR-369 MQTT flow and `simulate_flow.sh`
+  - Integrity check (no hardcoding, facades, shortcuts, cheating)
+  - Code correctness, error handling, SQL triggers/tablespaces
+  - Independent test verification
 
 ## Review Checklist
 - **Items reviewed**:
-  - `docker-compose.yml`: verified limits (1.5G, 500M, 500M, 1G), tmpfs uid=70, healthchecks, network, depends_on
-  - `.devcontainer/devcontainer.json`: verified JSON schema, features (Rust, Docker-in-Docker), extensions, settings
-  - `configure_limits.py`: verified unit tests (9/9 passed), presets, service limit mutations, dry-run, interactive menu, error handling
+  - `docker-compose.yml`: verified port 7547 exposure, CWMP environment variables, memory limits
+  - `postgres/init.sql`: verified `cpe_pending_commands` DDL, index, tablespace and trigger safety
+  - `python-api/app/models.py`: verified `CpePendingCommand`, relationships, dialect portability
+  - `python-api/app/schemas.py`: verified Pydantic V2 schemas for pending commands
+  - `python-api/app/routers/cpes.py`: verified dual-stack `reboot_cpe` and command endpoints
+  - `python-api/tests/test_api.py`: verified unit and adversarial tests
+  - `worker_m1_dualstack/handoff.md`: verified claims and outputs
 - **Verdict**: APPROVE
 - **Unverified claims**: none (all claims independently verified)
 
 ## Attack Surface
 - **Hypotheses tested**:
-  - Service name substring collisions (e.g. postgres vs postgres-replica): Passed
-  - Line ending handling (Windows CRLF vs Unix LF): Passed
-  - Malicious injection in memory limits (e.g. newline injection): Passed (rejected)
-  - Handling of service missing `deploy` block: Passed
-  - Handling of service with partial `deploy` block without `limits`: Identified non-critical edge case caught safely by PyYAML post-validation gate
-  - Invalid/negative/zero memory values: Passed (rejected)
-  - Interactive menu EOF/interrupt handling: Passed (graceful exit)
-- **Vulnerabilities found**: No security vulnerabilities; 1 minor edge-case in duplicate deploy key insertion, safely caught by the PyYAML gate.
-- **Untested angles**: Live container startup `docker-compose up` requires host Docker daemon (WSL lacks docker CLI).
+  - Foreign key cascading deletion on CPE removal: Passed (`test_cascade_delete_removes_pending_commands`)
+  - Dialect portability (PostgreSQL UUID vs SQLite String(36)): Passed (zero type errors)
+  - Device isolation across CPE pending commands: Passed (scoped queries return 404)
+  - SQL injection / schema constraints: Passed (parameterized queries)
+  - Backward compatibility of default parameters in `reboot_cpe`: Passed (defaults to dual mode, dispatches to MQTT)
+  - Memory limit parsing and preservation: Passed (`configure_limits.py --verify` and `--test`)
+  - AST integrity and trigger non-regression: Passed (68/68 PostgreSQL unittests)
+- **Vulnerabilities found**: No security vulnerabilities. Identified 2 minor improvements: protocol query parameter validation fallback, and pending command status string validation.
+- **Untested angles**: Live CWMP HTTP listener on host port 7547 (deferred to M2/M3).
 
 ## Key Decisions Made
-- Confirmed zero integrity violations (no dummy code, no hardcoded results).
-- Confirmed strict compliance with R1, R2, and R3.
-- Approved Milestone 1 deliverables with detailed adversarial findings documented.
+- Confirmed zero integrity violations (no dummy code, no hardcoded test results, genuine implementations).
+- Confirmed full interface conformance with `PROJECT.md` and zero regression on TR-369 MQTT flow.
+- Formally approved Milestone 1 deliverables with detailed handoff report in `handoff.md`.
 
 ## Artifact Index
-- DISPATCH.md — Initial dispatch instructions
+- DISPATCH.md — Dispatch instructions
 - BRIEFING.md — Persistent working memory
 - progress.md — Liveness heartbeat
 - handoff.md — Final review report

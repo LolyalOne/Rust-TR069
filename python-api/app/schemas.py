@@ -1,7 +1,9 @@
 """Pydantic V2 schemas for TR-369 USP ACS Manager API."""
 
 from datetime import datetime
-from typing import Any, Optional
+from enum import Enum
+from typing import Any, Optional, Union
+from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -98,3 +100,47 @@ class CommandDispatchResponse(BaseModel):
     command_key: str
     topic: str
     dispatched_at: datetime
+
+
+# -----------------------------------------------------------------------------
+# Pending Command Schemas (TR-069 / Dual-Stack Command Queue)
+# -----------------------------------------------------------------------------
+
+
+class PendingCommandStatus(str, Enum):
+    PENDING = "pending"
+    DISPATCHED = "dispatched"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
+class PendingCommandCreate(BaseModel):
+    command_type: str = Field(..., min_length=1, max_length=64, description="Command type (e.g. Reboot, GetParameterValues)")
+    command_payload: dict[str, Any] = Field(default_factory=dict, description="Command payload parameters")
+
+
+class PendingCommandUpdate(BaseModel):
+    status: Optional[PendingCommandStatus] = Field(
+        None, description="Execution status (pending, dispatched, completed, failed)"
+    )
+    dispatched_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    result_payload: Optional[dict[str, Any]] = None
+
+
+class PendingCommandResponse(BaseModel):
+    id: Union[UUID, str]
+    cpe_id: str
+    command_type: str
+    command_payload: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    created_at: datetime
+    dispatched_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    result_payload: Optional[dict[str, Any]] = None
+
+    model_config = ConfigDict(from_attributes=True)
+

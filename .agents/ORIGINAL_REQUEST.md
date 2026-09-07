@@ -89,3 +89,38 @@ O `README.md` do projeto deve ser atualizado. O Roadmap deve refletir a conclus�
 ### Verificação Integrada (Ponta a Ponta)
 - [ ] Executar o script principal fornecido `./simulate_flow.sh` e ele deve passar com sucesso e exit code 0. Ele garante que um dispositivo foi cadastrado na API (M4), emitiu eventos no broker, o core (M3) leu o broker e processou, salvou na RAM no Postgres (M2), a API consultou com sucesso e ativou um comando reverso no MQTT.
 
+## Follow-up — 2026-09-07T14:20:33Z
+
+# Refatoração Dual-Stack TR-069 Clássico e TR-369
+
+O projeto Rust-TR069 provou ser um sucesso na arquitetura USP/MQTT (TR-369), mas para aderir à realidade massiva dos provedores (ISPs), precisamos torná-arlo **Dual-Stack**. O sistema deve passar a suportar nativamente roteadores nível consumidor, como as ONTs Huawei EchoLife e TP-Link EX, que se comunicam via **TR-069 Clássico (CWMP sobre HTTP/XML)**.
+
+O objetivo é adicionar um servidor HTTP no worker em Rust para lidar com o legado, aproveitando todo o pipeline de banco de dados híbrido (PostgreSQL) e a manager API em FastAPI já existentes.
+
+Working directory: /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069
+Integrity mode: development
+
+## Requirements
+
+### R1. Implementar Servidor HTTP (CWMP) no Rust Core
+Modificar `rust-core/src/main.rs` para rodar, junto com o cliente MQTT (Tokio), um servidor web embarcado (usando `axum` ou `actix-web`) escutando na porta `7547` (Padrão TR-069).
+
+### R2. Parsing de XML/SOAP (TR-069 Inform)
+O servidor Rust deve receber as requisições `POST` das ONTs legadas contendo pacotes XML/SOAP (`<SOAP-ENV:Envelope>`, `<cwmp:Inform>`). Extrair os metadados principais (Número de Série, Fabricante, e parâmetros TR-181) utilizando uma biblioteca rápida de XML (ex: `roxmltree` ou `quick-xml`).
+
+### R3. Convergência MPSC
+Os dados extraídos do XML (TR-069) devem ser enviados para a **mesma fila MPSC** que já processa as mensagens do MQTT (TR-369). O sink no PostgreSQL permanece intocado, recebendo dados homogeneizados.
+
+### R4. Intercomunicação (FastAPI -> Postgres -> Rust)
+Como o TR-069 legado exige que os comandos aguardem a ONT se conectar (*polling*), a `python-api` deve inserir comandos destinados a essas ONTs numa tabela do Postgres ou via API HTTP direta para o Rust. O Rust Core deve responder as requisições XML da Huawei entregando esses comandos pendentes (ex: `GetParameterValues`, `Reboot`). 
+
+### R5. Atualizar Docker Compose
+Adicionar a exposição da porta `7547:7547` no serviço `rust-core` do `docker-compose.yml`.
+
+## Acceptance Criteria
+
+### Verificação Objetiva
+- [ ] O `rust-core` compila sem erros com as novas dependências (`axum`, biblioteca de XML).
+- [ ] O contêiner Rust sobre com sucesso expondo a porta `7547` além da conexão MQTT.
+- [ ] Um comando `curl` simulando um payload XML de Inform da Huawei EchoLife na porta `7547` resulta no salvamento correto dos dados na memória volátil (`cpe_live_state`) do banco.
+- [ ] Todos os testes unitários anteriores e o script `simulate_flow.sh` continuam funcionando para a parte MQTT.

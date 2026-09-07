@@ -167,18 +167,21 @@ async def test_duplicate_serial_on_reregistration_upsert(client: AsyncClient):
     with SN-1 (which belongs to cpe-1), the API should reject with 409 Conflict,
     NOT crash with an unhandled 500 error.
     """
-    await client.post("/api/v1/cpes", json={
+    r_dev1 = await client.post("/api/v1/cpes", json={
         "cpe_id": "cpe-dev-1",
         "serial_number": "SN-DEV-1",
         "manufacturer": "TP-Link",
         "model": "Archer-AX50",
     })
-    await client.post("/api/v1/cpes", json={
+    assert r_dev1.status_code == 201
+
+    r_dev2 = await client.post("/api/v1/cpes", json={
         "cpe_id": "cpe-dev-2",
         "serial_number": "SN-DEV-2",
         "manufacturer": "TP-Link",
         "model": "Archer-AX50",
     })
+    assert r_dev2.status_code == 201
 
     # Try to re-register cpe-dev-2 with cpe-dev-1's serial number
     r_conflict = await client.post("/api/v1/cpes", json={

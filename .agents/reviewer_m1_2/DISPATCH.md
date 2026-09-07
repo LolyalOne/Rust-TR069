@@ -1,27 +1,42 @@
-## 2026-09-07T01:04:15Z
+# Dispatch for reviewer_m1_2
 
-You are Reviewer 2 for Milestone 1.
-Your identity:
-- Archetype: teamwork_preview_reviewer
-- Working directory: /mnt/d/Projetos/TR069-181/.agents/reviewer_m1_2/
-- Parent conversation ID: 6258e12c-9553-47a2-9624-69521a0b2d82
-- Authoritative user request: /mnt/d/Projetos/TR069-181/ORIGINAL_REQUEST.md
-- Scope reference: /mnt/d/Projetos/TR069-181/.agents/orchestrator_1/PROJECT.md
-- Worker handoff: /mnt/d/Projetos/TR069-181/.agents/worker_m1_infra/handoff.md
+## Mission: Independent Architecture & Interface Conformance Review of Milestone 1
+Independently review changes made by `worker_m1_dualstack` across:
+- `docker-compose.yml`
+- `postgres/init.sql`
+- `python-api/app/models.py`, `schemas.py`, `routers/cpes.py`
+- `python-api/tests/`
 
-You MUST read /mnt/d/Projetos/TR069-181/ORIGINAL_REQUEST.md before starting work.
+## Inputs
+- Mandatory: `/mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/ORIGINAL_REQUEST.md`
+- Scope: `/mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/orchestrator_4/PROJECT.md`
+- Worker Handoff: `/mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/worker_m1_dualstack/handoff.md`
 
-Review target files:
-- /mnt/d/Projetos/TR069-181/docker-compose.yml
-- /mnt/d/Projetos/TR069-181/.devcontainer/devcontainer.json
-- /mnt/d/Projetos/TR069-181/configure_limits.py
+## Review Tasks
+1. Verify interface contracts: Does `cpe_pending_commands` match all architectural requirements in `PROJECT.md`?
+2. Verify backward compatibility: Does `reboot_cpe` preserve existing TR-369 MQTT flow when running `./simulate_flow.sh`?
+3. Run tests:
+   - `python3 configure_limits.py --verify`
+   - `python3 -m unittest discover -s postgres -p "test_*.py" -v`
+   - `PYTHONPATH=python-api pytest python-api/tests/ -v`
+4. Deliver structured review with explicit verdict: `APPROVE` or `REQUEST_CHANGES`.
 
-Tasks:
-1. Objectively and adversarially review code quality, edge case handling, and CLI usability in configure_limits.py.
-2. Verify YAML schema validity using python3 and yaml.safe_load.
-3. Test presets and limit updates with configure_limits.py.
-4. Record your explicit verdict: APPROVE or REQUEST_CHANGES.
+Write your full report to `/mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/reviewer_m1_2/handoff.md`.
 
-Write your report to:
-/mnt/d/Projetos/TR069-181/.agents/reviewer_m1_2/handoff.md
-Send a completion message back to parent when done.
+## 2026-09-07T14:54:49Z
+You are reviewer_m1_2.
+Your working directory is: /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/reviewer_m1_2
+Mandatory initial reads:
+1. /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/ORIGINAL_REQUEST.md
+2. /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/reviewer_m1_2/DISPATCH.md
+3. /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/orchestrator_4/PROJECT.md
+4. /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/worker_m1_dualstack/handoff.md
+
+Review Tasks:
+- Review interface conformance, database schema alignment with PROJECT.md, and non-regression of existing TR-369 MQTT flow.
+- Run verification tests:
+  - python3 configure_limits.py --verify
+  - python3 -m unittest discover -s postgres -p "test_*.py" -v
+  - PYTHONPATH=python-api pytest python-api/tests/ -v
+- Write your full review report to /mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/reviewer_m1_2/handoff.md.
+- Report your explicit verdict (APPROVE or REQUEST_CHANGES) via send_message.

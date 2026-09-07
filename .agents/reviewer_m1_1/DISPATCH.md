@@ -1,33 +1,25 @@
-## 2026-09-07T01:04:15Z
+# Dispatch for reviewer_m1_1
 
-<USER_REQUEST>
-You are Reviewer 1 for Milestone 1.
-Your identity:
-- Archetype: teamwork_preview_reviewer
-- Working directory: /mnt/d/Projetos/TR069-181/.agents/reviewer_m1_1/
-- Parent conversation ID: 6258e12c-9553-47a2-9624-69521a0b2d82
-- Authoritative user request: /mnt/d/Projetos/TR069-181/ORIGINAL_REQUEST.md
-- Scope reference: /mnt/d/Projetos/TR069-181/.agents/orchestrator_1/PROJECT.md
-- Worker handoff: /mnt/d/Projetos/TR069-181/.agents/worker_m1_infra/handoff.md
+## Mission: Code Review of Milestone 1 (Infra & Data Layer)
+Evaluate changes made by `worker_m1_dualstack` across:
+- `docker-compose.yml` (port 7547 exposure, env vars, memory limits)
+- `postgres/init.sql` (`cpe_pending_commands` table, indexes, constraints, trigger preservation)
+- `python-api/app/models.py`, `schemas.py`, `routers/cpes.py`
+- `python-api/tests/`
 
-You MUST read /mnt/d/Projetos/TR069-181/ORIGINAL_REQUEST.md before starting work.
+## Inputs
+- Mandatory: `/mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/ORIGINAL_REQUEST.md`
+- Scope: `/mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/orchestrator_4/PROJECT.md`
+- Worker Handoff: `/mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/worker_m1_dualstack/handoff.md`
 
-Review target files:
-- /mnt/d/Projetos/TR069-181/docker-compose.yml
-- /mnt/d/Projetos/TR069-181/.devcontainer/devcontainer.json
-- /mnt/d/Projetos/TR069-181/configure_limits.py
+## Review Tasks
+1. Verify code correctness, robustness, input validation, SQL injection safety, and error handling.
+2. Verify that `configure_limits.py` runs and reports VALID for all containers.
+3. Run PostgreSQL unit test suite: `python3 -m unittest discover -s postgres -p "test_*.py" -v`
+4. Run Python API test suite: `PYTHONPATH=python-api pytest python-api/tests/ -v`
+5. Deliver structured review with explicit verdict: `APPROVE` or `REQUEST_CHANGES`.
 
-Tasks:
-1. Verify compliance with R1 (strict memory limits: Postgres 1.5G, Mosquitto 500M, Rust 500M, FastAPI 1G; tmpfs uid=70 for Alpine postgres).
-2. Verify all 4 services in docker-compose.yml have robust healthchecks and python-api depends on mosquitto.
-3. Verify .devcontainer/devcontainer.json contains extensions and devcontainer features for Rust and Docker.
-4. Verify configure_limits.py works, preserves formatting/comments, and passes all tests. Run:
-   python3 /mnt/d/Projetos/TR069-181/configure_limits.py --show
-   python3 /mnt/d/Projetos/TR069-181/configure_limits.py --verify
-   python3 /mnt/d/Projetos/TR069-181/configure_limits.py --test
-5. Record your explicit verdict: APPROVE or REQUEST_CHANGES.
+Write your full report to `/mnt/c/Users/Administrator/Documents/Projetos_Pessoais/Rust-TR069/.agents/reviewer_m1_1/handoff.md`.
 
-Write your report to:
-/mnt/d/Projetos/TR069-181/.agents/reviewer_m1_1/handoff.md
-Send a completion message back to parent when done.
-</USER_REQUEST>
+## 2026-09-07T14:54:49Z
+Received user request to review Milestone 1 (Infra & Data Layer), run verification tests, stress-test work product, check for integrity violations, and report verdict.

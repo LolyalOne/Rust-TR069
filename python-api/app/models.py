@@ -1,5 +1,6 @@
 """Declarative ORM models for TR-369 USP ACS Manager."""
 
+import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Optional
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    Uuid,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -23,6 +25,7 @@ from app.database import Base
 # Dialect-agnostic JSON type that uses JSONB on PostgreSQL and JSON elsewhere
 JSON_TYPE = JSON().with_variant(JSONB, "postgresql")
 BIGINT_TYPE = BigInteger().with_variant(Integer, "sqlite")
+UUID_TYPE = Uuid(as_uuid=False).with_variant(String(36), "sqlite")
 
 
 class CpeInventory(Base):
@@ -63,6 +66,12 @@ class CpeInventory(Base):
         back_populates="inventory",
         cascade="all, delete-orphan",
         order_by="desc(CpeHistoricalMetrics.recorded_at)",
+    )
+    pending_commands: Mapped[list["CpePendingCommand"]] = relationship(
+        "CpePendingCommand",
+        back_populates="inventory",
+        cascade="all, delete-orphan",
+        order_by="desc(CpePendingCommand.created_at)",
     )
 
 
@@ -146,3 +155,52 @@ class CpeHistoricalMetrics(Base):
 
     # Relationship
     inventory: Mapped["CpeInventory"] = relationship("CpeInventory", back_populates="historical_metrics")
+
+
+class CpePendingCommand(Base):
+    """Persistent queue of TR-069 CWMP commands awaiting Inform session."""
+    __tablename__ = "cpe_pending_commands"
+
+    id: Mapped[str] = mapped_column(
+        UUID_TYPE,
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+    )
+    cpe_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("cpe_inventory.cpe_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    command_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    command_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSON_TYPE,
+        server_default="{}",
+        default=dict,
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    dispatched_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    result_payload: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSON_TYPE,
+        nullable=True,
+    )
+
+    # Relationship
+    inventory: Mapped["CpeInventory"] = relationship(
+        "CpeInventory",
+        back_populates="pending_commands",
+    )
+

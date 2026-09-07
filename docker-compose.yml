@@ -52,6 +52,10 @@ services:
       - DATABASE_URL=postgres://acs_user:acs_password@postgres:5432/acs_db
       - MQTT_HOST=mosquitto
       - MQTT_PORT=1883
+      - CWMP_PORT=7547
+      - CWMP_HOST=0.0.0.0
+    ports:
+      - "7547:7547"
     depends_on:
       postgres:
         condition: service_healthy

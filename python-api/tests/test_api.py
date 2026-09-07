@@ -3,6 +3,7 @@ Unit and integration tests for TR-369 USP ACS Manager FastAPI application.
 Verifies all routes, schema serialization, database operations, and MQTT command formatting.
 """
 
+from datetime import datetime, timezone
 import json
 import re
 from decimal import Decimal
@@ -443,4 +444,339 @@ async def test_mqtt_publisher_initialization():
     assert pub.host == "mosquitto"
     assert pub.port == 1883
     assert "fastapi-manager" in pub.client_id
+
+
+# -----------------------------------------------------------------------------
+# 9. TR-069 Pending Commands Queue Tests
+# -----------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_enqueue_pending_command(client: AsyncClient):
+    """Verifies that POST /api/v1/cpes/{cpe_id}/commands enqueues a command with 201 Created."""
+    reg_resp = await client.post("/api/v1/cpes", json={
+        "cpe_id": "cpe-huawei-001",
+        "serial_number": "HW-SN-001",
+        "manufacturer": "Huawei",
+        "model": "EchoLife-HG8245H",
+    })
+    assert reg_resp.status_code == 201
+
+    payload = {
+        "command_type": "GetParameterValues",
+        "command_payload": {
+            "parameter_names": [
+                "Device.Optical.Interface.1.OpticalSignalLevel",
+                "Device.DeviceInfo.SoftwareVersion",
+            ]
+        },
+    }
+    cmd_resp = await client.post("/api/v1/cpes/cpe-huawei-001/commands", json=payload)
+    assert cmd_resp.status_code == 201
+    data = cmd_resp.json()
+
+    assert data["cpe_id"] == "cpe-huawei-001"
+    assert data["command_type"] == "GetParameterValues"
+    assert data["command_payload"] == payload["command_payload"]
+    assert data["status"] == "pending"
+    assert "id" in data
+    assert data["id"] is not None
+    assert data["dispatched_at"] is None
+    assert data["completed_at"] is None
+    assert data["result_payload"] is None
+
+
+@pytest.mark.asyncio
+async def test_enqueue_command_nonexistent_cpe_returns_404(client: AsyncClient):
+    """Verifies that enqueuing a command for a nonexistent CPE returns 404."""
+    payload = {
+        "command_type": "Reboot",
+        "command_payload": {},
+    }
+    resp = await client.post("/api/v1/cpes/nonexistent-cpe/commands", json=payload)
+    assert resp.status_code == 404
+    assert "not found" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_enqueue_command_validation_error(client: AsyncClient):
+    """Verifies that enqueuing an invalid command (e.g. empty command_type) returns 422."""
+    await client.post("/api/v1/cpes", json={
+        "cpe_id": "cpe-valid-001",
+        "serial_number": "SN-VAL-001",
+        "manufacturer": "Huawei",
+        "model": "HG8245H",
+    })
+    resp = await client.post("/api/v1/cpes/cpe-valid-001/commands", json={
+        "command_type": "",
+        "command_payload": {},
+    })
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_pending_commands_and_status_filtering(client: AsyncClient):
+    """Verifies GET /api/v1/cpes/{cpe_id}/commands with pagination and status filtering."""
+    cpe_id = "cpe-filter-001"
+    await client.post("/api/v1/cpes", json={
+        "cpe_id": cpe_id,
+        "serial_number": "SN-FILTER-001",
+        "manufacturer": "TP-Link",
+        "model": "EX510",
+    })
+
+    r1 = await client.post(f"/api/v1/cpes/{cpe_id}/commands", json={
+        "command_type": "Reboot",
+        "command_payload": {"reason": "routine"},
+    })
+    cmd1_id = r1.json()["id"]
+
+    r2 = await client.post(f"/api/v1/cpes/{cpe_id}/commands", json={
+        "command_type": "GetParameterValues",
+        "command_payload": {"parameter_names": ["Device.Optical.Interface.1.OpticalSignalLevel"]},
+    })
+    cmd2_id = r2.json()["id"]
+
+    r3 = await client.post(f"/api/v1/cpes/{cpe_id}/commands", json={
+        "command_type": "SetParameterValues",
+        "command_payload": {"values": {"PeriodicInformInterval": 30}},
+    })
+    cmd3_id = r3.json()["id"]
+
+    await client.patch(f"/api/v1/cpes/{cpe_id}/commands/{cmd1_id}", json={
+        "status": "completed",
+        "result_payload": {"status": "ok"},
+    })
+
+    list_all = await client.get(f"/api/v1/cpes/{cpe_id}/commands")
+    assert list_all.status_code == 200
+    all_items = list_all.json()
+    assert len(all_items) == 3
+
+    list_pending = await client.get(f"/api/v1/cpes/{cpe_id}/commands?status=pending")
+    assert list_pending.status_code == 200
+    pending_items = list_pending.json()
+    assert len(pending_items) == 2
+    assert {item["id"] for item in pending_items} == {cmd2_id, cmd3_id}
+
+    list_completed = await client.get(f"/api/v1/cpes/{cpe_id}/commands?status=completed")
+    assert list_completed.status_code == 200
+    completed_items = list_completed.json()
+    assert len(completed_items) == 1
+    assert completed_items[0]["id"] == cmd1_id
+
+    list_page = await client.get(f"/api/v1/cpes/{cpe_id}/commands?skip=1&limit=1")
+    assert list_page.status_code == 200
+    page_items = list_page.json()
+    assert len(page_items) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_single_command_by_id(client: AsyncClient):
+    """Verifies GET /api/v1/cpes/{cpe_id}/commands/{command_id}."""
+    cpe_id = "cpe-single-cmd"
+    await client.post("/api/v1/cpes", json={
+        "cpe_id": cpe_id,
+        "serial_number": "SN-SINGLE-001",
+        "manufacturer": "Huawei",
+        "model": "HG8245H",
+    })
+
+    r = await client.post(f"/api/v1/cpes/{cpe_id}/commands", json={
+        "command_type": "Reboot",
+        "command_payload": {"key": "123"},
+    })
+    cmd_id = r.json()["id"]
+
+    fetch_resp = await client.get(f"/api/v1/cpes/{cpe_id}/commands/{cmd_id}")
+    assert fetch_resp.status_code == 200
+    data = fetch_resp.json()
+    assert data["id"] == cmd_id
+    assert data["command_type"] == "Reboot"
+    assert data["command_payload"] == {"key": "123"}
+
+    err_resp = await client.get(f"/api/v1/cpes/{cpe_id}/commands/00000000-0000-0000-0000-000000000000")
+    assert err_resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_update_command_lifecycle(client: AsyncClient):
+    """Verifies updating status, timestamps, and result_payload via PATCH."""
+    cpe_id = "cpe-lifecycle-001"
+    await client.post("/api/v1/cpes", json={
+        "cpe_id": cpe_id,
+        "serial_number": "SN-LC-001",
+        "manufacturer": "Huawei",
+        "model": "HG8245H",
+    })
+
+    create_resp = await client.post(f"/api/v1/cpes/{cpe_id}/commands", json={
+        "command_type": "GetParameterValues",
+        "command_payload": {"parameter_names": ["Device.DeviceInfo.ModelName"]},
+    })
+    cmd_id = create_resp.json()["id"]
+
+    now_dispatch = datetime.now(timezone.utc).isoformat()
+    patch_disp = await client.patch(f"/api/v1/cpes/{cpe_id}/commands/{cmd_id}", json={
+        "status": "dispatched",
+        "dispatched_at": now_dispatch,
+    })
+    assert patch_disp.status_code == 200
+    disp_data = patch_disp.json()
+    assert disp_data["status"] == "dispatched"
+    assert disp_data["dispatched_at"] is not None
+
+    now_complete = datetime.now(timezone.utc).isoformat()
+    result_data = {
+        "parameters": {
+            "Device.DeviceInfo.ModelName": "EchoLife HG8245H",
+        }
+    }
+    patch_comp = await client.patch(f"/api/v1/cpes/{cpe_id}/commands/{cmd_id}", json={
+        "status": "completed",
+        "completed_at": now_complete,
+        "result_payload": result_data,
+    })
+    assert patch_comp.status_code == 200
+    comp_data = patch_comp.json()
+    assert comp_data["status"] == "completed"
+    assert comp_data["completed_at"] is not None
+    assert comp_data["result_payload"] == result_data
+
+
+@pytest.mark.asyncio
+async def test_cascade_delete_removes_pending_commands(client: AsyncClient):
+    """Verifies that deleting a CPE cascades and cleans up all its pending commands."""
+    cpe_id = "cpe-cascade-cmd"
+    await client.post("/api/v1/cpes", json={
+        "cpe_id": cpe_id,
+        "serial_number": "SN-CASC-001",
+        "manufacturer": "Huawei",
+        "model": "HG8245H",
+    })
+
+    await client.post(f"/api/v1/cpes/{cpe_id}/commands", json={
+        "command_type": "Reboot",
+        "command_payload": {},
+    })
+    await client.post(f"/api/v1/cpes/{cpe_id}/commands", json={
+        "command_type": "GetParameterValues",
+        "command_payload": {},
+    })
+
+    del_resp = await client.delete(f"/api/v1/cpes/{cpe_id}")
+    assert del_resp.status_code == 200
+
+    cmd_list_resp = await client.get(f"/api/v1/cpes/{cpe_id}/commands")
+    assert cmd_list_resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_reboot_endpoint_dual_stack_default(client: AsyncClient):
+    """
+    Verifies that default POST /api/v1/cpes/{cpe_id}/reboot:
+    1. Queues command in cpe_pending_commands table.
+    2. Publishes to MQTT broker.
+    3. Returns 200 OK with CommandDispatchResponse.
+    """
+    cpe_id = "cpe-reboot-dual"
+    await client.post("/api/v1/cpes", json={
+        "cpe_id": cpe_id,
+        "serial_number": "SN-RBT-001",
+        "manufacturer": "TP-Link",
+        "model": "Archer-AX50",
+    })
+
+    captured = {}
+
+    async def fake_publish(topic, payload, qos=1):
+        captured["topic"] = topic
+        captured["payload"] = payload
+        return None
+
+    with patch.object(mqtt_publisher, "publish", side_effect=fake_publish):
+        r = await client.post(f"/api/v1/cpes/{cpe_id}/reboot")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["cpe_id"] == cpe_id
+        assert data["status"] == "dispatched"
+        assert "reboot" in data["command"].lower()
+
+    assert f"usp/endpoint/{cpe_id}/request" in captured.get("topic", "")
+
+    cmds_resp = await client.get(f"/api/v1/cpes/{cpe_id}/commands")
+    assert cmds_resp.status_code == 200
+    cmds = cmds_resp.json()
+    assert len(cmds) == 1
+    assert cmds[0]["command_type"] == "Reboot"
+    assert cmds[0]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_reboot_endpoint_tr069_only(client: AsyncClient):
+    """
+    Verifies that POST /api/v1/cpes/{cpe_id}/reboot?protocol=tr069:
+    1. Queues command in cpe_pending_commands table.
+    2. Does NOT call MQTT publisher.
+    3. Returns status='queued'.
+    """
+    cpe_id = "cpe-reboot-tr069"
+    await client.post("/api/v1/cpes", json={
+        "cpe_id": cpe_id,
+        "serial_number": "SN-RBT-TR069",
+        "manufacturer": "Huawei",
+        "model": "HG8245H",
+    })
+
+    mqtt_mock = AsyncMock()
+    with patch.object(mqtt_publisher, "publish", mqtt_mock):
+        r = await client.post(f"/api/v1/cpes/{cpe_id}/reboot?protocol=tr069")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["cpe_id"] == cpe_id
+        assert data["status"] == "queued"
+        assert data["command"] == "Reboot"
+        assert data["topic"] == "tr069/cwmp"
+
+    mqtt_mock.assert_not_called()
+
+    cmds_resp = await client.get(f"/api/v1/cpes/{cpe_id}/commands")
+    assert cmds_resp.status_code == 200
+    cmds = cmds_resp.json()
+    assert len(cmds) == 1
+    assert cmds[0]["command_type"] == "Reboot"
+
+
+@pytest.mark.asyncio
+async def test_reboot_endpoint_tr369_only(client: AsyncClient):
+    """
+    Verifies that POST /api/v1/cpes/{cpe_id}/reboot?protocol=tr369:
+    1. Publishes to MQTT broker.
+    2. Does NOT queue in cpe_pending_commands.
+    """
+    cpe_id = "cpe-reboot-tr369"
+    await client.post("/api/v1/cpes", json={
+        "cpe_id": cpe_id,
+        "serial_number": "SN-RBT-TR369",
+        "manufacturer": "TP-Link",
+        "model": "Archer-AX50",
+    })
+
+    captured = {}
+
+    async def fake_publish(topic, payload, qos=1):
+        captured["topic"] = topic
+        return None
+
+    with patch.object(mqtt_publisher, "publish", side_effect=fake_publish):
+        r = await client.post(f"/api/v1/cpes/{cpe_id}/reboot?protocol=tr369")
+        assert r.status_code == 200
+        assert r.json()["status"] == "dispatched"
+
+    assert f"usp/endpoint/{cpe_id}/request" in captured.get("topic", "")
+
+    cmds_resp = await client.get(f"/api/v1/cpes/{cpe_id}/commands")
+    assert cmds_resp.status_code == 200
+    cmds = cmds_resp.json()
+    assert len(cmds) == 0
+
 
