@@ -72,17 +72,17 @@ graph TD
     CPE2 -->|Protobuf TR-369 / JSON| TOPIC_IN
     CPEn -->|Protobuf TR-369 / JSON| TOPIC_IN
     TOPIC_IN --> MQTT_CLI
-    MQTT_CLI -->|Filtra /request| MPSC
+    MQTT_CLI -->|"Filtra /request"| MPSC
     MPSC --> PROST
     PROST --> DB_SINK
-    DB_SINK -->|Zero-WAL Fast Write| RAM_TBL
-    RAM_TBL -->|Disparo sob Delta > 1.0 dBm| TRIGGER
-    TRIGGER -->|Gravação Histórica (Sem Update em Inventory)| DISK_TBL
+    DB_SINK -->|"Zero-WAL Fast Write"| RAM_TBL
+    RAM_TBL -->|"Disparo sob Delta > 1.0 dBm"| TRIGGER
+    TRIGGER -->|"Gravação Histórica (Sem Update em Inventory)"| DISK_TBL
 
     %% Fluxos Downstream (Comandos)
-    DASH -->|POST /api/v1/cpes/{id}/reboot| API
+    DASH -->|"POST /api/v1/cpes/{id}/reboot"| API
     N8N -->|POST /api/v1/cpes| API
-    API -->|Consulta Microsegundos em RAM| RAM_TBL
+    API -->|"Consulta Microsegundos em RAM"| RAM_TBL
     API --> GUNICORN
     GUNICORN --> PUB
     PUB -->|Comando TR-369 Reboot| TOPIC_OUT
